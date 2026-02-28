@@ -1,0 +1,13 @@
+[package]
+name = "rdynarmic"
+version = "0.1.0"
+edition = "2021"
+description = "Rust port of dynarmic - ARM64 dynamic recompiler"
+
+[dependencies]
+rxbyak = { path = "../rxbyak" }
+bitflags = "2"
+log = "0.4"
+thiserror = "2"
+
+[dev-dependencies]

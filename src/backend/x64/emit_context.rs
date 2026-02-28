@@ -78,11 +78,38 @@ pub struct EmitContext<'a> {
     pub location: LocationDescriptor,
     /// Emitter configuration and callbacks.
     pub config: &'a EmitConfig,
+    /// Dispatcher return_from_run_code offsets (4 entries).
+    ///
+    /// When `Some`, terminals emit `jmp rel32` to these absolute code buffer
+    /// offsets instead of inline `ret`. When `None` (e.g., in unit tests),
+    /// terminals emit `ret` directly for standalone testing.
+    pub dispatcher_offsets: Option<[usize; 4]>,
+    /// Base pointer of the code buffer (needed to compute `jmp rel32` targets).
+    pub code_base_ptr: *const u8,
 }
 
 impl<'a> EmitContext<'a> {
     pub fn new(location: LocationDescriptor, config: &'a EmitConfig) -> Self {
-        Self { location, config }
+        Self {
+            location,
+            config,
+            dispatcher_offsets: None,
+            code_base_ptr: std::ptr::null(),
+        }
+    }
+
+    pub fn with_dispatcher(
+        location: LocationDescriptor,
+        config: &'a EmitConfig,
+        dispatcher_offsets: [usize; 4],
+        code_base_ptr: *const u8,
+    ) -> Self {
+        Self {
+            location,
+            config,
+            dispatcher_offsets: Some(dispatcher_offsets),
+            code_base_ptr,
+        }
     }
 }
 
