@@ -69,7 +69,7 @@ pub struct BlockOfCode {
     /// Whether the prelude (entry/exit stubs) has been generated.
     prelude_complete: bool,
     /// Code pointer where user-emitted blocks begin (after prelude).
-    code_begin_offset: usize,
+    pub(crate) code_begin_offset: usize,
 }
 
 impl BlockOfCode {
@@ -256,6 +256,24 @@ impl BlockOfCode {
         self.asm.int3()
     }
 
+    /// Emit: `lock or dword [r15 + offset], value`
+    ///
+    /// Atomically OR a 32-bit value into a JitState field.
+    /// Used by step_code to set the STEP halt reason bit.
+    pub fn emit_lock_or_dword_r15(&mut self, offset: usize, value: u32) -> rxbyak::Result<()> {
+        self.asm.lock()?;
+        self.asm.or_(dword_ptr(RegExp::from(R15) + offset as i32), value as i32)?;
+        Ok(())
+    }
+
+    /// Emit: N single-byte NOP instructions (0x90).
+    pub fn emit_nop_pad(&mut self, count: usize) -> rxbyak::Result<()> {
+        for _ in 0..count {
+            self.asm.nop()?;
+        }
+        Ok(())
+    }
+
     /// Generate the dispatcher prelude: run_code entry point and
     /// return_from_run_code exit stubs.
     ///
@@ -363,12 +381,12 @@ impl BlockOfCode {
             cb.add_ticks.emit_call_simple(&mut self.asm)?;
         }
 
-        // Read halt_reason and clear it (non-atomic for Phase 12 simplicity).
-        // mov eax, [r15 + halt_reason]
+        // Read halt_reason and atomically clear it.
+        // xor eax, eax; xchg [r15 + halt_reason], eax
+        // (xchg with memory is implicitly locked on x86 — no LOCK prefix needed)
         let eax = rxbyak::Reg::gpr32(0); // EAX
-        self.asm.mov(eax, dword_ptr(RegExp::from(R15) + halt_offset as i32))?;
-        // mov dword [r15 + halt_reason], 0
-        self.asm.mov(dword_ptr(RegExp::from(R15) + halt_offset as i32), 0i32)?;
+        self.asm.xor_(eax, eax)?;
+        self.asm.xchg(eax, dword_ptr(RegExp::from(R15) + halt_offset as i32))?;
 
         // Deallocate stack frame and restore callee-saved registers
         self.emit_pop_callee_save_and_adjust_stack(frame_size)?;
@@ -377,6 +395,57 @@ impl BlockOfCode {
         self.asm.ret()?;
 
         // Record all offsets
+        // ---- step_code entry ----
+        // Dedicated single-step entry point: sets cycle budget to 1,
+        // atomically sets STEP in halt_reason, then jumps to the block.
+        let step_code_offset = self.asm.size();
+
+        // Save callee-saved registers and allocate StackLayout
+        self.emit_push_callee_save_and_adjust_stack(frame_size)?;
+
+        // R15 = RDI (jit_state), RBX = RSI (code_ptr)
+        self.asm.mov(R15, RDI)?;
+        self.asm.mov(RBX, rxbyak::RSI)?;
+
+        // Set cycle budget to 1 instruction
+        if cb.enable_cycle_counting {
+            self.asm.mov(qword_ptr(RegExp::from(RSP) + cycles_to_run_off as i32), 1i32)?;
+            self.asm.mov(qword_ptr(RegExp::from(RSP) + cycles_remaining_off as i32), 1i32)?;
+        }
+
+        // Check if already halted — bail to force-return path if so
+        let step_already_halted = self.asm.create_label();
+        self.asm.cmp(dword_ptr(RegExp::from(R15) + halt_offset as i32), 0i32)?;
+        self.asm.jnz(&step_already_halted, JmpType::Near)?;
+
+        // Atomically set STEP bit in halt_reason
+        self.emit_lock_or_dword_r15(halt_offset, crate::halt_reason::HaltReason::STEP.bits())?;
+
+        // Switch MXCSR to guest mode
+        self.emit_switch_mxcsr_on_entry()?;
+
+        // Jump to the compiled block
+        self.asm.jmp_reg(RBX)?;
+
+        // Already halted: go through the normal exit path
+        self.asm.bind(&step_already_halted)?;
+
+        // Compute ticks if cycle counting
+        if cb.enable_cycle_counting {
+            self.asm.mov(RDI, qword_ptr(RegExp::from(RSP) + cycles_to_run_off as i32))?;
+            self.asm.sub(RDI, qword_ptr(RegExp::from(RSP) + cycles_remaining_off as i32))?;
+            cb.add_ticks.emit_call_simple(&mut self.asm)?;
+        }
+
+        // Read halt_reason atomically and clear
+        let eax_step = rxbyak::Reg::gpr32(0);
+        self.asm.xor_(eax_step, eax_step)?;
+        self.asm.xchg(eax_step, dword_ptr(RegExp::from(R15) + halt_offset as i32))?;
+
+        // Restore and return
+        self.emit_pop_callee_save_and_adjust_stack(frame_size)?;
+        self.asm.ret()?;
+
         let labels = DispatcherLabels {
             return_from_run_code: [
                 rfrc_0_offset,
@@ -385,7 +454,7 @@ impl BlockOfCode {
                 rfrc_force_mxcsr_offset,
             ],
             run_code_offset,
-            step_code_offset: run_code_offset, // same for Phase 12
+            step_code_offset,
         };
 
         // Mark prelude as complete
@@ -491,5 +560,93 @@ mod tests {
         // Clear cache — should reset to prelude size
         boc.clear_cache();
         assert_eq!(boc.asm.size(), prelude_size);
+    }
+
+    #[test]
+    fn test_atomic_halt_reason_xchg() {
+        // Verify that gen_run_code emits xchg (0x87) instead of two movs
+        // for the halt_reason read-and-clear sequence.
+        let mut boc = BlockOfCode::with_size(65536).unwrap();
+        let cb = RunCodeCallbacks {
+            lookup_block: Box::new(ArgCallback::new(stub_lookup as u64, 0)),
+            add_ticks: Box::new(ArgCallback::new(stub_add_ticks as u64, 0)),
+            get_ticks_remaining: Box::new(ArgCallback::new(stub_get_ticks as u64, 0)),
+            enable_cycle_counting: false,
+        };
+        let labels = boc.gen_run_code(&cb).unwrap();
+        let code = unsafe {
+            std::slice::from_raw_parts(boc.code_base_ptr(), boc.code_size())
+        };
+        // Search for xchg opcode (0x87) in the return path
+        // It should appear after the return_from_run_code[FORCE_RETURN|MXCSR] offset
+        let rfrc_last = labels.return_from_run_code[3];
+        let search = &code[rfrc_last..];
+        assert!(search.windows(1).any(|w| w[0] == 0x87),
+            "Expected xchg (0x87) in the dispatcher return path");
+    }
+
+    #[test]
+    fn test_emit_lock_or_dword_r15() {
+        let mut boc = BlockOfCode::with_size(4096).unwrap();
+        let before = boc.asm.size();
+        boc.emit_lock_or_dword_r15(0x10, 0x01).unwrap();
+        let after = boc.asm.size();
+        // lock prefix (1) + or with memory+imm should emit several bytes
+        assert!(after - before > 3, "lock or should emit at least 4 bytes");
+        // First byte should be LOCK prefix 0xF0
+        let code = unsafe {
+            std::slice::from_raw_parts(boc.code_base_ptr().add(before), after - before)
+        };
+        assert_eq!(code[0], 0xF0, "First byte should be LOCK prefix");
+    }
+
+    #[test]
+    fn test_emit_nop_pad() {
+        let mut boc = BlockOfCode::with_size(4096).unwrap();
+        let before = boc.asm.size();
+        boc.emit_nop_pad(5).unwrap();
+        assert_eq!(boc.asm.size() - before, 5);
+        let code = unsafe {
+            std::slice::from_raw_parts(boc.code_base_ptr().add(before), 5)
+        };
+        for &b in code {
+            assert_eq!(b, 0x90, "All bytes should be NOP");
+        }
+    }
+
+    #[test]
+    fn test_step_code_offset_differs_from_run_code() {
+        let mut boc = BlockOfCode::with_size(65536).unwrap();
+        let cb = RunCodeCallbacks {
+            lookup_block: Box::new(ArgCallback::new(stub_lookup as u64, 0)),
+            add_ticks: Box::new(ArgCallback::new(stub_add_ticks as u64, 0)),
+            get_ticks_remaining: Box::new(ArgCallback::new(stub_get_ticks as u64, 0)),
+            enable_cycle_counting: true,
+        };
+        let labels = boc.gen_run_code(&cb).unwrap();
+        assert_ne!(labels.step_code_offset, labels.run_code_offset,
+            "step_code should have its own entry point");
+        assert!(labels.step_code_offset > labels.return_from_run_code[3],
+            "step_code should come after all return_from_run_code entries");
+    }
+
+    #[test]
+    fn test_step_code_contains_lock_or() {
+        // step_code should contain LOCK (0xF0) prefix for atomic STEP set
+        let mut boc = BlockOfCode::with_size(65536).unwrap();
+        let cb = RunCodeCallbacks {
+            lookup_block: Box::new(ArgCallback::new(stub_lookup as u64, 0)),
+            add_ticks: Box::new(ArgCallback::new(stub_add_ticks as u64, 0)),
+            get_ticks_remaining: Box::new(ArgCallback::new(stub_get_ticks as u64, 0)),
+            enable_cycle_counting: false,
+        };
+        let labels = boc.gen_run_code(&cb).unwrap();
+        let code = unsafe {
+            std::slice::from_raw_parts(boc.code_base_ptr(), boc.code_size())
+        };
+        // Search for LOCK prefix (0xF0) in the step_code region
+        let step_region = &code[labels.step_code_offset..];
+        assert!(step_region.windows(1).any(|w| w[0] == 0xF0),
+            "step_code should contain LOCK prefix for atomic OR");
     }
 }

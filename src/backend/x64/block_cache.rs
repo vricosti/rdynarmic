@@ -58,6 +58,11 @@ impl BlockCache {
     pub fn is_empty(&self) -> bool {
         self.blocks.is_empty()
     }
+
+    /// Iterate over all cached location descriptors.
+    pub fn keys(&self) -> impl Iterator<Item = &LocationDescriptor> {
+        self.blocks.keys()
+    }
 }
 
 impl Default for BlockCache {

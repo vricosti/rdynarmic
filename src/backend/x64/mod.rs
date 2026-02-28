@@ -31,4 +31,5 @@ pub mod emit_fp_vector_convert;
 pub mod emit_terminal;
 pub mod emit;
 pub mod block_cache;
+pub mod patch_info;
 pub mod a64_emit_x64;

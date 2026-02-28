@@ -6,6 +6,7 @@ use crate::backend::x64::block_of_code::FORCE_RETURN;
 use crate::backend::x64::emit_context::EmitContext;
 use crate::backend::x64::emit_data_processing::load_nzcv_into_flags;
 use crate::backend::x64::jit_state::A64JitState;
+use crate::backend::x64::patch_info::{PatchEntry, PatchType, PATCH_JG_SIZE, PATCH_JZ_SIZE, PATCH_JMP_SIZE};
 use crate::backend::x64::reg_alloc::RegAlloc;
 use crate::backend::x64::stack_layout::StackLayout;
 use crate::ir::cond::Cond;
@@ -46,13 +47,11 @@ pub fn emit_terminal(ctx: &EmitContext, ra: &mut RegAlloc, terminal: &Terminal) 
         }
 
         Terminal::PopRSBHint => {
-            // No RSB optimization yet — fall back to dispatch
-            emit_terminal_return_to_dispatch(ctx, ra);
+            emit_terminal_pop_rsb_hint(ctx, ra);
         }
 
         Terminal::FastDispatchHint => {
-            // No fast dispatch optimization yet — fall back to dispatch
-            emit_terminal_return_to_dispatch(ctx, ra);
+            emit_terminal_fast_dispatch_hint(ctx, ra);
         }
 
         Terminal::If { cond, then_, else_ } => {
@@ -93,7 +92,7 @@ fn emit_terminal_return_to_dispatch(ctx: &EmitContext, ra: &mut RegAlloc) {
 // LinkBlock: set PC and return to dispatch
 // ---------------------------------------------------------------------------
 
-/// Emit: set PC to next, check cycles/halt inline, jump to dispatcher.
+/// Emit: set PC to next, check cycles/halt inline, jump to dispatcher or direct link.
 fn emit_terminal_link_block(ctx: &EmitContext, ra: &mut RegAlloc, next: crate::ir::location::LocationDescriptor) {
     let a64_next = A64LocationDescriptor::from_location(next);
     let pc = a64_next.pc();
@@ -104,31 +103,67 @@ fn emit_terminal_link_block(ctx: &EmitContext, ra: &mut RegAlloc, next: crate::i
     ra.asm.mov(qword_ptr(RegExp::from(R15) + pc_offset as i32), RAX).unwrap();
 
     if let Some(offsets) = ctx.dispatcher_offsets {
+        let use_linking = ctx.enable_block_linking && !ctx.is_single_step;
+
         if ctx.config.enable_cycle_counting {
             // Check cycles_remaining > 0
             let cycles_offset = StackLayout::cycles_remaining_offset();
-            let budget_exhausted = ra.asm.create_label();
             ra.asm.cmp(qword_ptr(RegExp::from(RSP) + cycles_offset as i32), 0i32).unwrap();
-            ra.asm.jle(&budget_exhausted, JmpType::Near).unwrap();
 
-            // Cycles remain: return to dispatch for next block lookup
-            emit_jmp_to_offset(ra.asm, offsets[0], ctx.code_base_ptr);
+            if use_linking {
+                // Record patch slot offset and emit patchable jg slot
+                let patch_offset = ra.asm.size();
+                ctx.patch_entries.borrow_mut().push(PatchEntry {
+                    target: next,
+                    patch_type: PatchType::Jg,
+                    code_offset: patch_offset,
+                });
 
-            // Budget exhausted: force return
-            ra.asm.bind(&budget_exhausted).unwrap();
+                // Look up target in cache
+                let target_ptr = ctx.block_lookup.as_ref()
+                    .and_then(|lookup| lookup(next));
+
+                emit_patch_jg(ra.asm, target_ptr, offsets, ctx.code_base_ptr);
+            } else {
+                let budget_exhausted = ra.asm.create_label();
+                ra.asm.jle(&budget_exhausted, JmpType::Near).unwrap();
+
+                // Cycles remain: return to dispatch for next block lookup
+                emit_jmp_to_offset(ra.asm, offsets[0], ctx.code_base_ptr);
+
+                // Budget exhausted: force return
+                ra.asm.bind(&budget_exhausted).unwrap();
+            }
             emit_jmp_to_offset(ra.asm, offsets[FORCE_RETURN], ctx.code_base_ptr);
         } else {
             // No cycle counting: check halt_reason
             let halt_offset = A64JitState::offset_of_halt_reason();
-            let halted = ra.asm.create_label();
             ra.asm.cmp(dword_ptr(RegExp::from(R15) + halt_offset as i32), 0i32).unwrap();
-            ra.asm.jnz(&halted, JmpType::Near).unwrap();
 
-            // Not halted: normal dispatch
-            emit_jmp_to_offset(ra.asm, offsets[0], ctx.code_base_ptr);
+            if use_linking {
+                // Record patch slot offset and emit patchable jz slot
+                let patch_offset = ra.asm.size();
+                ctx.patch_entries.borrow_mut().push(PatchEntry {
+                    target: next,
+                    patch_type: PatchType::Jz,
+                    code_offset: patch_offset,
+                });
 
-            // Halted: force return
-            ra.asm.bind(&halted).unwrap();
+                // Look up target in cache
+                let target_ptr = ctx.block_lookup.as_ref()
+                    .and_then(|lookup| lookup(next));
+
+                emit_patch_jz(ra.asm, target_ptr, offsets, ctx.code_base_ptr);
+            } else {
+                let halted = ra.asm.create_label();
+                ra.asm.jnz(&halted, JmpType::Near).unwrap();
+
+                // Not halted: normal dispatch
+                emit_jmp_to_offset(ra.asm, offsets[0], ctx.code_base_ptr);
+
+                // Halted: force return
+                ra.asm.bind(&halted).unwrap();
+            }
             emit_jmp_to_offset(ra.asm, offsets[FORCE_RETURN], ctx.code_base_ptr);
         }
     } else {
@@ -139,15 +174,11 @@ fn emit_terminal_link_block(ctx: &EmitContext, ra: &mut RegAlloc, next: crate::i
             ra.asm.cmp(qword_ptr(RegExp::from(RSP) + cycles_offset as i32), 0i32).unwrap();
             ra.asm.jle(&halt_label, JmpType::Near).unwrap();
 
-            if ctx.config.enable_cycle_counting {
-                emit_add_ticks(ctx, ra);
-            }
+            emit_add_ticks(ctx, ra);
             ra.asm.ret().unwrap();
 
             ra.asm.bind(&halt_label).unwrap();
-            if ctx.config.enable_cycle_counting {
-                emit_add_ticks(ctx, ra);
-            }
+            emit_add_ticks(ctx, ra);
             ra.asm.ret().unwrap();
         } else {
             let halt_offset = A64JitState::offset_of_halt_reason();
@@ -167,7 +198,7 @@ fn emit_terminal_link_block(ctx: &EmitContext, ra: &mut RegAlloc, next: crate::i
 // LinkBlockFast: unconditional jump to next block
 // ---------------------------------------------------------------------------
 
-/// Emit: set PC to next, return to dispatch (unconditional).
+/// Emit: set PC to next, return to dispatch or direct link (unconditional).
 fn emit_terminal_link_block_fast(ctx: &EmitContext, ra: &mut RegAlloc, next: crate::ir::location::LocationDescriptor) {
     let a64_next = A64LocationDescriptor::from_location(next);
     let pc = a64_next.pc();
@@ -178,7 +209,25 @@ fn emit_terminal_link_block_fast(ctx: &EmitContext, ra: &mut RegAlloc, next: cra
     ra.asm.mov(qword_ptr(RegExp::from(R15) + pc_offset as i32), RAX).unwrap();
 
     if let Some(offsets) = ctx.dispatcher_offsets {
-        emit_jmp_to_offset(ra.asm, offsets[0], ctx.code_base_ptr);
+        let use_linking = ctx.enable_block_linking && !ctx.is_single_step;
+
+        if use_linking {
+            // Record patch slot offset and emit patchable jmp slot
+            let patch_offset = ra.asm.size();
+            ctx.patch_entries.borrow_mut().push(PatchEntry {
+                target: next,
+                patch_type: PatchType::Jmp,
+                code_offset: patch_offset,
+            });
+
+            // Look up target in cache
+            let target_ptr = ctx.block_lookup.as_ref()
+                .and_then(|lookup| lookup(next));
+
+            emit_patch_jmp(ra.asm, target_ptr, offsets, ctx.code_base_ptr);
+        } else {
+            emit_jmp_to_offset(ra.asm, offsets[0], ctx.code_base_ptr);
+        }
     } else {
         if ctx.config.enable_cycle_counting {
             emit_add_ticks(ctx, ra);
@@ -305,6 +354,142 @@ fn emit_jcc(asm: &mut CodeAssembler, cond: Cond, label: &Label) {
     }.unwrap();
 }
 
+// ---------------------------------------------------------------------------
+// PopRSBHint: jump to RSB handler or fall back to dispatch
+// ---------------------------------------------------------------------------
+
+fn emit_terminal_pop_rsb_hint(ctx: &EmitContext, ra: &mut RegAlloc) {
+    if ctx.enable_rsb && !ctx.is_single_step {
+        if let Some(handler_offset) = ctx.terminal_handler_pop_rsb_hint {
+            if let Some(offsets) = ctx.dispatcher_offsets {
+                let _ = offsets; // used indirectly by the handler
+                emit_jmp_to_offset(ra.asm, handler_offset, ctx.code_base_ptr);
+                return;
+            }
+        }
+    }
+    // Fallback: just dispatch normally
+    emit_terminal_return_to_dispatch(ctx, ra);
+}
+
+// ---------------------------------------------------------------------------
+// FastDispatchHint: jump to fast dispatch handler or fall back to dispatch
+// ---------------------------------------------------------------------------
+
+fn emit_terminal_fast_dispatch_hint(ctx: &EmitContext, ra: &mut RegAlloc) {
+    if ctx.enable_fast_dispatch && !ctx.is_single_step {
+        if let Some(handler_offset) = ctx.terminal_handler_fast_dispatch_hint {
+            if let Some(offsets) = ctx.dispatcher_offsets {
+                let _ = offsets;
+                emit_jmp_to_offset(ra.asm, handler_offset, ctx.code_base_ptr);
+                return;
+            }
+        }
+    }
+    // Fallback: just dispatch normally
+    emit_terminal_return_to_dispatch(ctx, ra);
+}
+
+// ---------------------------------------------------------------------------
+// Patch slot emitters for block linking
+// ---------------------------------------------------------------------------
+
+/// Emit a patchable jg slot (PATCH_JG_SIZE bytes).
+///
+/// If target_ptr is Some, emits `jg <target>` (direct link).
+/// If None, emits `jg <fallback>` where fallback is return_from_run_code[0].
+/// Always pads to PATCH_JG_SIZE bytes with NOPs.
+fn emit_patch_jg(
+    asm: &mut CodeAssembler,
+    target_ptr: Option<*const u8>,
+    offsets: [usize; 4],
+    code_base: *const u8,
+) {
+    let begin = asm.size();
+    // jg rel32 is 6 bytes: 0x0F 0x8F + 4-byte displacement
+    let target = if let Some(ptr) = target_ptr {
+        ptr as usize
+    } else {
+        code_base as usize + offsets[0]
+    };
+    let jg_end = asm.size() + 6;
+    let jg_end_addr = code_base as usize + jg_end;
+    let disp = (target as i64) - (jg_end_addr as i64);
+    asm.db(0x0F).unwrap();
+    asm.db(0x8F).unwrap();
+    asm.dd(disp as u32).unwrap();
+    // NOP pad to PATCH_JG_SIZE
+    let used = asm.size() - begin;
+    for _ in used..PATCH_JG_SIZE {
+        asm.nop().unwrap();
+    }
+}
+
+/// Emit a patchable jz slot (PATCH_JZ_SIZE bytes).
+///
+/// If target_ptr is Some, emits `jz <target>` (direct link).
+/// If None, emits `jz <fallback>` where fallback is return_from_run_code[0].
+/// Always pads to PATCH_JZ_SIZE bytes with NOPs.
+fn emit_patch_jz(
+    asm: &mut CodeAssembler,
+    target_ptr: Option<*const u8>,
+    offsets: [usize; 4],
+    code_base: *const u8,
+) {
+    let begin = asm.size();
+    // jz rel32 is 6 bytes: 0x0F 0x84 + 4-byte displacement
+    let target = if let Some(ptr) = target_ptr {
+        ptr as usize
+    } else {
+        code_base as usize + offsets[0]
+    };
+    let jz_end = asm.size() + 6;
+    let jz_end_addr = code_base as usize + jz_end;
+    let disp = (target as i64) - (jz_end_addr as i64);
+    asm.db(0x0F).unwrap();
+    asm.db(0x84).unwrap();
+    asm.dd(disp as u32).unwrap();
+    // NOP pad to PATCH_JZ_SIZE
+    let used = asm.size() - begin;
+    for _ in used..PATCH_JZ_SIZE {
+        asm.nop().unwrap();
+    }
+}
+
+/// Emit a patchable jmp slot (PATCH_JMP_SIZE bytes).
+///
+/// If target_ptr is Some, emits `jmp <target>` (direct link).
+/// If None, emits `jmp <fallback>` where fallback is return_from_run_code[0].
+/// Always pads to PATCH_JMP_SIZE bytes with NOPs.
+fn emit_patch_jmp(
+    asm: &mut CodeAssembler,
+    target_ptr: Option<*const u8>,
+    offsets: [usize; 4],
+    code_base: *const u8,
+) {
+    let begin = asm.size();
+    // jmp rel32 is 5 bytes: 0xE9 + 4-byte displacement
+    let target = if let Some(ptr) = target_ptr {
+        ptr as usize
+    } else {
+        code_base as usize + offsets[0]
+    };
+    let jmp_end = asm.size() + 5;
+    let jmp_end_addr = code_base as usize + jmp_end;
+    let disp = (target as i64) - (jmp_end_addr as i64);
+    asm.db(0xE9).unwrap();
+    asm.dd(disp as u32).unwrap();
+    // NOP pad to PATCH_JMP_SIZE
+    let used = asm.size() - begin;
+    for _ in used..PATCH_JMP_SIZE {
+        asm.nop().unwrap();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Low-level jump helpers
+// ---------------------------------------------------------------------------
+
 /// Emit a raw `jmp rel32` to an absolute code buffer offset.
 ///
 /// Computes the relative displacement from the end of the 5-byte jmp
@@ -370,5 +555,69 @@ mod tests {
         emit_jmp_to_offset(&mut asm, 0, base);
         // Should emit 5 bytes (0xE9 + disp32)
         assert_eq!(asm.size() - before, 5);
+    }
+
+    #[test]
+    fn test_emit_patch_jg_size() {
+        let mut asm = rxbyak::CodeAssembler::new(4096).unwrap();
+        let base = asm.top();
+        let before = asm.size();
+        emit_patch_jg(&mut asm, None, [100, 200, 300, 400], base);
+        assert_eq!(asm.size() - before, PATCH_JG_SIZE,
+            "jg patch slot should be exactly {} bytes", PATCH_JG_SIZE);
+    }
+
+    #[test]
+    fn test_emit_patch_jz_size() {
+        let mut asm = rxbyak::CodeAssembler::new(4096).unwrap();
+        let base = asm.top();
+        let before = asm.size();
+        emit_patch_jz(&mut asm, None, [100, 200, 300, 400], base);
+        assert_eq!(asm.size() - before, PATCH_JZ_SIZE,
+            "jz patch slot should be exactly {} bytes", PATCH_JZ_SIZE);
+    }
+
+    #[test]
+    fn test_emit_patch_jmp_size() {
+        let mut asm = rxbyak::CodeAssembler::new(4096).unwrap();
+        let base = asm.top();
+        let before = asm.size();
+        emit_patch_jmp(&mut asm, None, [100, 200, 300, 400], base);
+        assert_eq!(asm.size() - before, PATCH_JMP_SIZE,
+            "jmp patch slot should be exactly {} bytes", PATCH_JMP_SIZE);
+    }
+
+    #[test]
+    fn test_emit_patch_jmp_with_target() {
+        let mut asm = rxbyak::CodeAssembler::new(4096).unwrap();
+        let base = asm.top();
+        // Emit some NOPs to create a "target" at a known offset
+        for _ in 0..64 { asm.nop().unwrap(); }
+        let target_ptr = unsafe { base.add(64) };
+        let before = asm.size();
+        emit_patch_jmp(&mut asm, Some(target_ptr), [100, 200, 300, 400], base);
+        assert_eq!(asm.size() - before, PATCH_JMP_SIZE);
+        // First byte should be 0xE9 (jmp rel32)
+        let code = unsafe {
+            std::slice::from_raw_parts(base.add(before), PATCH_JMP_SIZE)
+        };
+        assert_eq!(code[0], 0xE9, "First byte should be JMP opcode");
+    }
+
+    #[test]
+    fn test_emit_patch_jg_with_target() {
+        let mut asm = rxbyak::CodeAssembler::new(4096).unwrap();
+        let base = asm.top();
+        for _ in 0..64 { asm.nop().unwrap(); }
+        let target_ptr = unsafe { base.add(64) };
+        let before = asm.size();
+        emit_patch_jg(&mut asm, Some(target_ptr), [100, 200, 300, 400], base);
+        assert_eq!(asm.size() - before, PATCH_JG_SIZE);
+        let code = unsafe {
+            std::slice::from_raw_parts(base.add(before), PATCH_JG_SIZE)
+        };
+        // jg rel32: 0x0F 0x8F
+        assert_eq!(code[0], 0x0F, "First byte should be 0x0F");
+        assert_eq!(code[1], 0x8F, "Second byte should be 0x8F (jg)");
     }
 }

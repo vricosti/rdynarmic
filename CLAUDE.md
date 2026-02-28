@@ -47,9 +47,10 @@ src/ir/              → IR definition: Opcode enum (~650 opcodes), Inst, Block,
 src/frontend/        → ARM64 → IR translation
 
 src/backend/x64/     → x86-64 JIT code emission
-  a64_emit_x64.rs    → Block compilation pipeline: translate → optimize → emit → cache
-  block_of_code.rs   → Code buffer + dispatcher assembly (gen_run_code entry/exit stubs)
+  a64_emit_x64.rs    → Block compilation pipeline, patch/unpatch, RSB/FastDispatch handlers
+  block_of_code.rs   → Code buffer + dispatcher assembly (gen_run_code + step_code stubs)
   block_cache.rs     → HashMap<LocationDescriptor, CachedBlock> with invalidate_range
+  patch_info.rs      → PatchInformation, PatchEntry, PatchType, patch slot constants
   emit.rs            → Main dispatcher: match on Opcode → emit function (~750 match arms)
   emit_terminal.rs   → Terminal → dispatcher jmp (or fallback ret for unit tests)
   emit_context.rs    → EmitContext with dispatcher offsets + block descriptors
@@ -135,14 +136,25 @@ During JIT execution:
 - **Phase 10**: ALU, memory, FP scalar, packed, crypto, CRC32, exclusive memory, saturation emit (~155 opcodes)
 - **Phase 11**: All vector/SIMD opcodes (~350 opcodes across 10 new files + 2 FP vector files). Native SSE for common ops, stack-based Rust fallback for complex ops.
 - **Phase 12**: Public JIT API, block cache, and execution loop. `A64Jit` struct with `run()`/`step()`, `JitCallbacks` trait, `BlockCache`, `A64EmitX64` compilation pipeline, dispatcher assembly (`gen_run_code`), terminal-to-dispatcher wiring, 25+ callback trampolines. 159 tests pass, 0 clippy warnings.
+- **Phase 13**: Block linking, fast dispatch, atomic halt_reason, step mode. Atomic `xchg` for halt_reason read-and-clear, dedicated `step_code` entry with `lock or` STEP bit, direct block-to-block jump patching via fixed-size NOP-padded slots (`PatchTable`), RSB pop handler with descriptor matching, fast dispatch hash table (1M entries), `patch()`/`unpatch()` for cache invalidation. 175 tests pass, 0 clippy warnings.
 
 ### Current State
 
-The JIT is feature-complete for basic execution: ARM64 instructions are translated to IR, optimized, emitted as native x86-64 code, cached, and executed via the dispatcher loop. The public `A64Jit` API is ready for integration with ruzu.
+The JIT is feature-complete with performance optimizations: block linking eliminates dispatcher overhead for block-to-block transitions, RSB predicts return addresses, and the fast dispatch hash table accelerates indirect branches. The `step()` method uses a dedicated entry point with atomic STEP flag. The public `A64Jit` API is ready for integration with ruzu.
 
-### Not Yet Implemented
+### Architecture additions (Phase 13)
 
-- **Block linking**: all terminals return to dispatcher (no direct block-to-block jumps)
-- **Fast dispatch / RSB**: PopRSBHint and FastDispatchHint fall back to dispatcher lookup
-- **Atomic halt_reason**: uses non-atomic mov+mov (upgrade to lock xchg later)
-- **Step mode**: uses halt_reason STEP bit (no dedicated step_code entry yet)
+```
+src/backend/x64/patch_info.rs   → PatchInformation, PatchEntry, PatchType, slot size constants
+```
+
+#### Block Linking
+
+LinkBlock/LinkBlockFast terminals emit fixed-size patch slots (23/22 bytes, NOP-padded). When a target block compiles later, `patch()` overwrites the jump displacement in-place via `asm.set_size()`. Cache invalidation calls `unpatch()` to revert slots to dispatcher fallback.
+
+#### RSB / Fast Dispatch
+
+- **PopRSBHint**: prelude handler computes location descriptor from PC+FPCR, decrements `rsb_ptr`, compares `rsb_location_descriptors[ptr]` — hit: `jmp [rsb_codeptrs+ptr*8]`, miss: fall to dispatcher.
+- **FastDispatchHint**: prelude handler hashes descriptor, indexes 1M-entry table — hit: `jmp [entry+8]`, miss: store descriptor, fall to dispatcher.
+- **PushRSB**: stores descriptor + patchable `mov rcx, imm64` code pointer at `rsb[ptr]`.
+- Both bypass to dispatcher when `is_single_step` is true.

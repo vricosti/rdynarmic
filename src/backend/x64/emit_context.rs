@@ -1,4 +1,7 @@
+use std::cell::RefCell;
+
 use crate::backend::x64::callback::Callback;
+use crate::backend::x64::patch_info::PatchEntry;
 use crate::ir::location::LocationDescriptor;
 
 /// Descriptor for a compiled block of native code.
@@ -86,6 +89,25 @@ pub struct EmitContext<'a> {
     pub dispatcher_offsets: Option<[usize; 4]>,
     /// Base pointer of the code buffer (needed to compute `jmp rel32` targets).
     pub code_base_ptr: *const u8,
+    /// Whether this block is being compiled for single-stepping.
+    /// When true, block linking and fast dispatch are disabled.
+    pub is_single_step: bool,
+    /// Whether block linking (direct jumps between blocks) is enabled.
+    pub enable_block_linking: bool,
+    /// Patch entries collected during emission (populated by terminal emitters).
+    /// Uses RefCell so terminal emitters can append through `&EmitContext`.
+    pub patch_entries: RefCell<Vec<PatchEntry>>,
+    /// Block lookup function for checking if a target is already compiled.
+    /// Returns the native code entrypoint if the block is cached.
+    pub block_lookup: Option<Box<dyn Fn(LocationDescriptor) -> Option<*const u8> + 'a>>,
+    /// Code buffer offset of the PopRSBHint terminal handler (prelude code).
+    pub terminal_handler_pop_rsb_hint: Option<usize>,
+    /// Code buffer offset of the FastDispatchHint terminal handler (prelude code).
+    pub terminal_handler_fast_dispatch_hint: Option<usize>,
+    /// Whether RSB optimization is enabled.
+    pub enable_rsb: bool,
+    /// Whether fast dispatch table is enabled.
+    pub enable_fast_dispatch: bool,
 }
 
 impl<'a> EmitContext<'a> {
@@ -95,6 +117,14 @@ impl<'a> EmitContext<'a> {
             config,
             dispatcher_offsets: None,
             code_base_ptr: std::ptr::null(),
+            is_single_step: false,
+            enable_block_linking: false,
+            patch_entries: RefCell::new(Vec::new()),
+            block_lookup: None,
+            terminal_handler_pop_rsb_hint: None,
+            terminal_handler_fast_dispatch_hint: None,
+            enable_rsb: false,
+            enable_fast_dispatch: false,
         }
     }
 
@@ -104,12 +134,26 @@ impl<'a> EmitContext<'a> {
         dispatcher_offsets: [usize; 4],
         code_base_ptr: *const u8,
     ) -> Self {
+        let a64_loc = crate::ir::location::A64LocationDescriptor::from_location(location);
         Self {
             location,
             config,
             dispatcher_offsets: Some(dispatcher_offsets),
             code_base_ptr,
+            is_single_step: a64_loc.single_stepping(),
+            enable_block_linking: false,
+            patch_entries: RefCell::new(Vec::new()),
+            block_lookup: None,
+            terminal_handler_pop_rsb_hint: None,
+            terminal_handler_fast_dispatch_hint: None,
+            enable_rsb: false,
+            enable_fast_dispatch: false,
         }
+    }
+
+    /// Take collected patch entries out of the context.
+    pub fn take_patch_entries(&self) -> Vec<PatchEntry> {
+        self.patch_entries.borrow_mut().drain(..).collect()
     }
 }
 

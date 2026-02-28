@@ -1,14 +1,16 @@
 use rxbyak::RegExp;
-use rxbyak::R15;
+use rxbyak::{RAX, R15, RCX};
 use rxbyak::{dword_ptr, qword_ptr, xmmword_ptr};
 
 use crate::backend::x64::emit_context::EmitContext;
 use crate::backend::x64::hostloc::*;
 use crate::backend::x64::jit_state::A64JitState;
 use crate::backend::x64::nzcv_util;
+use crate::backend::x64::patch_info::{PatchEntry, PatchType};
 use crate::backend::x64::reg_alloc::RegAlloc;
 use crate::backend::x64::stack_layout::StackLayout;
 use crate::ir::inst::Inst;
+use crate::ir::location::LocationDescriptor;
 use crate::ir::value::InstRef;
 
 // ---------------------------------------------------------------------------
@@ -487,22 +489,61 @@ pub fn emit_a64_get_dczid(_ctx: &EmitContext, ra: &mut RegAlloc, inst_ref: InstR
 // ---------------------------------------------------------------------------
 
 /// PushRSB: push a return address hint onto the return stack buffer.
-pub fn emit_push_rsb(_ctx: &EmitContext, ra: &mut RegAlloc, _inst_ref: InstRef, _inst: &Inst) {
+///
+/// Stores the target location descriptor and a patchable code pointer
+/// at rsb[ptr], then increments and wraps the pointer.
+pub fn emit_push_rsb(ctx: &EmitContext, ra: &mut RegAlloc, _inst_ref: InstRef, inst: &Inst) {
     let rsb_ptr_offset = A64JitState::offset_of_rsb_ptr();
+    let rsb_loc_offset = A64JitState::offset_of_rsb_location_descriptors();
+    let rsb_code_offset = A64JitState::offset_of_rsb_codeptrs();
 
-    // Load current RSB pointer
-    let ptr_reg = ra.scratch_gpr();
-    ra.asm.mov(ptr_reg.cvt32().unwrap(), dword_ptr(RegExp::from(R15) + rsb_ptr_offset as i32)).unwrap();
+    // Get the target location descriptor from the immediate argument
+    let target_loc_value = inst.args[0].get_imm_as_u64();
+    let target_loc = LocationDescriptor::new(target_loc_value);
+
+    // Load current RSB pointer into EAX
+    ra.asm.mov(rxbyak::Reg::gpr32(0), dword_ptr(RegExp::from(R15) + rsb_ptr_offset as i32)).unwrap();
 
     // Increment and mask: rsb_ptr = (rsb_ptr + 1) & RSB_PTR_MASK
-    ra.asm.add(ptr_reg.cvt32().unwrap(), 1).unwrap();
-    ra.asm.and_(ptr_reg.cvt32().unwrap(), crate::backend::x64::jit_state::RSB_PTR_MASK as i32).unwrap();
+    ra.asm.add(rxbyak::Reg::gpr32(0), 1).unwrap();
+    ra.asm.and_(rxbyak::Reg::gpr32(0), crate::backend::x64::jit_state::RSB_PTR_MASK as i32).unwrap();
 
-    // Store updated pointer
-    ra.asm.mov(dword_ptr(RegExp::from(R15) + rsb_ptr_offset as i32), ptr_reg.cvt32().unwrap()).unwrap();
+    // Store updated pointer back
+    ra.asm.mov(dword_ptr(RegExp::from(R15) + rsb_ptr_offset as i32), rxbyak::Reg::gpr32(0)).unwrap();
 
-    // TODO: Store location descriptor and code pointer at rsb[ptr].
-    // For now, RSB hints are ignored (fall back to dispatch on PopRSBHint).
+    // Compute address for rsb_location_descriptors[eax]:
+    // RCX = R15 + RAX*8 + rsb_loc_offset
+    ra.asm.lea(RCX, qword_ptr(RegExp::from(R15) + RAX * 8u8 + rsb_loc_offset as i32)).unwrap();
+
+    // Store location descriptor at rsb_location_descriptors[ptr]
+    // Use a scratch register for the 64-bit immediate
+    let tmp = ra.scratch_gpr();
+    ra.asm.mov(tmp, target_loc_value as i64).unwrap();
+    ra.asm.mov(qword_ptr(RegExp::from(RCX)), tmp).unwrap();
+
+    // Store code pointer at rsb_codeptrs[ptr]
+    // Compute rsb_codeptrs address
+    let code_addr_reg = ra.scratch_gpr();
+    ra.asm.lea(code_addr_reg, qword_ptr(RegExp::from(R15) + RAX * 8u8 + rsb_code_offset as i32)).unwrap();
+
+    // Emit patchable mov rcx, imm64 for code pointer
+    // This will be patched when the target block is compiled
+    let patch_offset = ra.asm.size();
+    // mov rcx, imm64 (REX.W B9 + 8 bytes) = 10 bytes
+    let target_ptr = ctx.block_lookup.as_ref()
+        .and_then(|lookup| lookup(target_loc));
+    let code_ptr_value = target_ptr.map_or(0u64, |p| p as u64);
+    ra.asm.mov(RCX, code_ptr_value as i64).unwrap();
+
+    // Record patch entry for the mov rcx
+    ctx.patch_entries.borrow_mut().push(PatchEntry {
+        target: target_loc,
+        patch_type: PatchType::MovRcx,
+        code_offset: patch_offset,
+    });
+
+    // Store code pointer
+    ra.asm.mov(qword_ptr(RegExp::from(code_addr_reg)), RCX).unwrap();
 }
 
 // ---------------------------------------------------------------------------

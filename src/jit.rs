@@ -162,10 +162,51 @@ impl A64Jit {
     }
 
     /// Execute a single instruction (single-step).
+    ///
+    /// Uses a dedicated step_code entry point that:
+    /// - Sets cycle budget to 1
+    /// - Atomically sets the STEP bit in halt_reason
+    /// - Compiles a single-instruction block (via single_stepping descriptor)
     pub fn step(&mut self) -> HaltReason {
-        // Set single-step halt reason, then run
-        self.inner.jit_state.halt_reason |= HaltReason::STEP.bits();
-        self.run()
+        assert!(!self.inner.is_executing, "Recursive JIT execution not allowed");
+        self.inner.is_executing = true;
+
+        // Build location with single_stepping=true for 1-instruction block
+        let a64_loc = crate::ir::location::A64LocationDescriptor::new(
+            self.inner.jit_state.pc,
+            self.inner.jit_state.fpcr,
+            true,
+        );
+        let location = a64_loc.to_location();
+
+        let inner_ptr = &mut *self.inner as *mut JitInner;
+
+        // Make code writable for compilation
+        if let Some(ref mut emitter) = self.inner.emitter {
+            let _ = emitter.make_writable();
+        }
+
+        let read_code = move |vaddr: u64| -> Option<u32> {
+            let inner = unsafe { &*inner_ptr };
+            inner.callbacks.memory_read_code(vaddr)
+        };
+
+        let code_ptr = self.inner.emitter.as_mut().unwrap()
+            .get_or_compile_block(location, &read_code);
+
+        // Get the step_code function pointer
+        let step_fn = {
+            let emitter = self.inner.emitter.as_mut().unwrap();
+            unsafe { emitter.get_step_code_fn().unwrap() }
+        };
+
+        // Call the step_code entry (sets STEP atomically, cycles=1)
+        let halt_bits = unsafe {
+            step_fn(&mut self.inner.jit_state as *mut _, code_ptr)
+        };
+
+        self.inner.is_executing = false;
+        HaltReason::from_bits_truncate(halt_bits)
     }
 
     /// Request halt from another thread (or same thread in a callback).
