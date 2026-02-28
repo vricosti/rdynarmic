@@ -34,6 +34,10 @@ ARM64 instruction → Frontend decoder → IR Block (SSA opcodes) → Optimizati
 ### Key Modules
 
 ```
+src/halt_reason.rs   → HaltReason bitflags (Step, Svc, Breakpoint, ExternalHalt, etc.)
+src/jit_config.rs    → JitCallbacks trait (25+ host methods) + JitConfig struct
+src/jit.rs           → Public A64Jit: run()/step(), register accessors, callback trampolines
+
 src/ir/              → IR definition: Opcode enum (~650 opcodes), Inst, Block, Value, Type
   opcode.rs          → All IR opcodes (core, vector, FP scalar, FP vector, memory, A64)
   inst.rs            → Instruction struct with args, opcode, type
@@ -43,11 +47,15 @@ src/ir/              → IR definition: Opcode enum (~650 opcodes), Inst, Block,
 src/frontend/        → ARM64 → IR translation
 
 src/backend/x64/     → x86-64 JIT code emission
+  a64_emit_x64.rs    → Block compilation pipeline: translate → optimize → emit → cache
+  block_of_code.rs   → Code buffer + dispatcher assembly (gen_run_code entry/exit stubs)
+  block_cache.rs     → HashMap<LocationDescriptor, CachedBlock> with invalidate_range
   emit.rs            → Main dispatcher: match on Opcode → emit function (~750 match arms)
+  emit_terminal.rs   → Terminal → dispatcher jmp (or fallback ret for unit tests)
+  emit_context.rs    → EmitContext with dispatcher offsets + block descriptors
   reg_alloc.rs       → Register allocator (GPR/XMM allocation, spilling, host_call)
-  emit_context.rs    → EmitContext with block descriptors
   jit_state.rs       → A64JitState: guest registers, NZCV, fpsr_qc (accessed via R15)
-  block_of_code.rs   → Code buffer management
+  callback.rs        → Callback trait, SimpleCallback, ArgCallback for host calls
   abi.rs             → System V ABI: RDI/RSI/RDX/RCX params, RAX return
 ```
 
@@ -81,14 +89,60 @@ emit_two_arg_fallback(ra, inst_ref, inst, fallback_fn as usize)
 
 Saturation variants OR the return value (QC flag in RAX) into `fpsr_qc` via R15.
 
+### Execution Flow
+
+```
+A64Jit::run()
+  → get_or_compile_block(pc)    // translate → optimize → emit → cache
+  → run_code_fn(jit_state, code_ptr)
+      → dispatcher prelude: push callee-save, alloc StackLayout, R15=jit_state
+      → switch MXCSR to guest, jmp to compiled block
+      → block executes, terminal jmps to return_from_run_code[N]
+      → dispatcher checks halt_reason / cycles, either:
+          - LookupBlock callback → jmp to next block (loop)
+          - switch MXCSR to host, add_ticks, return HaltReason in EAX
+```
+
+### Public API (src/jit.rs)
+
+```rust
+let mut jit = A64Jit::new(JitConfig {
+    callbacks: Box::new(my_callbacks),  // impl JitCallbacks
+    enable_cycle_counting: true,
+    code_cache_size: 128 * 1024 * 1024,
+    enable_optimizations: true,
+})?;
+
+jit.set_pc(entry_point);
+jit.set_sp(stack_top);
+let reason = jit.run();   // returns HaltReason
+```
+
+### Dispatcher Convention
+
+During JIT execution:
+- **R15** = `*mut A64JitState` (callee-saved, stable across host calls)
+- **RSP** = `*StackLayout` (cycles_remaining, cycles_to_run, spill slots, host MXCSR)
+- MXCSR switched between host/guest at JIT entry/exit boundaries
+- Terminals jump to `return_from_run_code[index]` (4 variants by MXCSR state × force return)
+- LookupBlock callback compiles on cache miss, returns native code pointer in RAX
+
 ## Implementation Progress
 
 ### Completed Phases
 
 - **Phase 1-9**: IR definition, frontend decoder, optimization passes, core x64 backend scaffolding
 - **Phase 10**: ALU, memory, FP scalar, packed, crypto, CRC32, exclusive memory, saturation emit (~155 opcodes)
-- **Phase 11**: All vector/SIMD opcodes (~350 opcodes across 10 new files + 2 FP vector files). Native SSE for common ops, stack-based Rust fallback for complex ops. 145 tests pass, 0 clippy warnings.
+- **Phase 11**: All vector/SIMD opcodes (~350 opcodes across 10 new files + 2 FP vector files). Native SSE for common ops, stack-based Rust fallback for complex ops.
+- **Phase 12**: Public JIT API, block cache, and execution loop. `A64Jit` struct with `run()`/`step()`, `JitCallbacks` trait, `BlockCache`, `A64EmitX64` compilation pipeline, dispatcher assembly (`gen_run_code`), terminal-to-dispatcher wiring, 25+ callback trampolines. 159 tests pass, 0 clippy warnings.
 
 ### Current State
 
-All ~650 IR opcodes are wired in `emit.rs`. The catch-all `unimplemented!()` has been removed. The x64 backend is feature-complete for code emission.
+The JIT is feature-complete for basic execution: ARM64 instructions are translated to IR, optimized, emitted as native x86-64 code, cached, and executed via the dispatcher loop. The public `A64Jit` API is ready for integration with ruzu.
+
+### Not Yet Implemented
+
+- **Block linking**: all terminals return to dispatcher (no direct block-to-block jumps)
+- **Fast dispatch / RSB**: PopRSBHint and FastDispatchHint fall back to dispatcher lookup
+- **Atomic halt_reason**: uses non-atomic mov+mov (upgrade to lock xchg later)
+- **Step mode**: uses halt_reason STEP bit (no dedicated step_code entry yet)
