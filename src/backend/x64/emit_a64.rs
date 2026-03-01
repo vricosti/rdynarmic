@@ -411,12 +411,27 @@ pub fn emit_a64_call_supervisor(ctx: &EmitContext, ra: &mut RegAlloc, _inst_ref:
 }
 
 /// A64ExceptionRaised: store exception info, set halt_reason.
-pub fn emit_a64_exception_raised(ctx: &EmitContext, ra: &mut RegAlloc, _inst_ref: InstRef, _inst: &Inst) {
+///
+/// args[0] = pc (ImmU64), args[1] = exception code (ImmU64)
+pub fn emit_a64_exception_raised(ctx: &EmitContext, ra: &mut RegAlloc, _inst_ref: InstRef, inst: &Inst) {
+    use rxbyak::{RSI, RDX};
+
     let halt_offset = A64JitState::offset_of_halt_reason();
 
-    // Set halt_reason for exception
-    ra.asm.mov(dword_ptr(RegExp::from(R15) + halt_offset as i32), 4i32).unwrap();
+    // Set halt_reason to EXCEPTION_RAISED (1 << 3 = 8)
+    ra.asm.mov(dword_ptr(RegExp::from(R15) + halt_offset as i32), 8i32).unwrap();
 
+    // Load immediate arguments into SysV ABI parameter registers.
+    // ArgCallback will set RDI = inner_ptr. We pre-load:
+    //   RSI = pc (arg 2)
+    //   RDX = exception code (arg 3)
+    let pc_val = inst.args[0].get_imm_as_u64();
+    let exc_val = inst.args[1].get_imm_as_u64();
+    ra.asm.mov(RSI, pc_val as i64).unwrap();
+    ra.asm.mov(RDX, exc_val as i64).unwrap();
+
+    // emit_call_simple sets RDI=inner_ptr then calls the trampoline.
+    // RSI and RDX are preserved (ArgCallback only writes RDI before the call).
     ctx.config.callbacks.exception_raised.emit_call_simple(&mut *ra.asm).unwrap();
 }
 

@@ -2,7 +2,6 @@ use std::fmt;
 use crate::ir::types::Type;
 
 /// IR opcodes. Ported from dynarmic's opcodes.inc.
-/// A32-specific opcodes are omitted (A64 frontend only).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u16)]
 #[allow(non_camel_case_types)]
@@ -673,6 +672,68 @@ pub enum Opcode {
     A64ExclusiveWriteMemory32,
     A64ExclusiveWriteMemory64,
     A64ExclusiveWriteMemory128,
+
+    // --- A32 context getters/setters ---
+    A32SetCheckBit,
+    A32GetCFlag,
+    A32GetRegister,
+    A32SetRegister,
+    A32GetExtendedRegister32,
+    A32GetExtendedRegister64,
+    A32SetExtendedRegister32,
+    A32SetExtendedRegister64,
+    A32GetVector,
+    A32SetVector,
+    A32GetCpsr,
+    A32SetCpsr,
+    A32SetCpsrNZCVRaw,
+    A32SetCpsrNZCV,
+    A32SetCpsrNZCVQ,
+    A32SetCpsrNZ,
+    A32SetCpsrNZC,
+    A32OrQFlag,
+    A32GetGEFlags,
+    A32SetGEFlags,
+    A32SetGEFlagsCompressed,
+    A32BXWritePC,
+    A32UpdateUpperLocationDescriptor,
+    A32CallSupervisor,
+    A32ExceptionRaised,
+    A32DataSynchronizationBarrier,
+    A32DataMemoryBarrier,
+    A32InstructionSynchronizationBarrier,
+    A32GetFpscr,
+    A32SetFpscr,
+    A32GetFpscrNZCV,
+    A32SetFpscrNZCV,
+
+    // --- A32 Memory ---
+    A32ClearExclusive,
+    A32ReadMemory8,
+    A32ReadMemory16,
+    A32ReadMemory32,
+    A32ReadMemory64,
+    A32ExclusiveReadMemory8,
+    A32ExclusiveReadMemory16,
+    A32ExclusiveReadMemory32,
+    A32ExclusiveReadMemory64,
+    A32WriteMemory8,
+    A32WriteMemory16,
+    A32WriteMemory32,
+    A32WriteMemory64,
+    A32ExclusiveWriteMemory8,
+    A32ExclusiveWriteMemory16,
+    A32ExclusiveWriteMemory32,
+    A32ExclusiveWriteMemory64,
+
+    // --- A32 Coprocessor ---
+    A32CoprocInternalOperation,
+    A32CoprocSendOneWord,
+    A32CoprocSendTwoWords,
+    A32CoprocGetOneWord,
+    A32CoprocGetTwoWords,
+    A32CoprocLoadWords,
+    A32CoprocStoreWords,
 }
 
 /// Opcode metadata: return type and argument types.
@@ -715,7 +776,24 @@ impl Opcode {
             A64WriteMemory64 | A64WriteMemory128 |
             A64ExclusiveWriteMemory8 | A64ExclusiveWriteMemory16 |
             A64ExclusiveWriteMemory32 | A64ExclusiveWriteMemory64 |
-            A64ExclusiveWriteMemory128
+            A64ExclusiveWriteMemory128 |
+            // A32 side effects
+            A32SetCheckBit | A32SetRegister |
+            A32SetExtendedRegister32 | A32SetExtendedRegister64 | A32SetVector |
+            A32SetCpsr | A32SetCpsrNZCVRaw | A32SetCpsrNZCV | A32SetCpsrNZCVQ |
+            A32SetCpsrNZ | A32SetCpsrNZC | A32OrQFlag |
+            A32SetGEFlags | A32SetGEFlagsCompressed |
+            A32BXWritePC | A32UpdateUpperLocationDescriptor |
+            A32CallSupervisor | A32ExceptionRaised |
+            A32DataSynchronizationBarrier | A32DataMemoryBarrier |
+            A32InstructionSynchronizationBarrier |
+            A32SetFpscr | A32SetFpscrNZCV |
+            A32ClearExclusive |
+            A32WriteMemory8 | A32WriteMemory16 | A32WriteMemory32 | A32WriteMemory64 |
+            A32ExclusiveWriteMemory8 | A32ExclusiveWriteMemory16 |
+            A32ExclusiveWriteMemory32 | A32ExclusiveWriteMemory64 |
+            A32CoprocInternalOperation | A32CoprocSendOneWord | A32CoprocSendTwoWords |
+            A32CoprocLoadWords | A32CoprocStoreWords
         )
     }
 
@@ -727,7 +805,10 @@ impl Opcode {
             A64ReadMemory64 | A64ReadMemory128 |
             A64ExclusiveReadMemory8 | A64ExclusiveReadMemory16 |
             A64ExclusiveReadMemory32 | A64ExclusiveReadMemory64 |
-            A64ExclusiveReadMemory128
+            A64ExclusiveReadMemory128 |
+            A32ReadMemory8 | A32ReadMemory16 | A32ReadMemory32 | A32ReadMemory64 |
+            A32ExclusiveReadMemory8 | A32ExclusiveReadMemory16 |
+            A32ExclusiveReadMemory32 | A32ExclusiveReadMemory64
         )
     }
 
@@ -739,7 +820,10 @@ impl Opcode {
             A64WriteMemory64 | A64WriteMemory128 |
             A64ExclusiveWriteMemory8 | A64ExclusiveWriteMemory16 |
             A64ExclusiveWriteMemory32 | A64ExclusiveWriteMemory64 |
-            A64ExclusiveWriteMemory128
+            A64ExclusiveWriteMemory128 |
+            A32WriteMemory8 | A32WriteMemory16 | A32WriteMemory32 | A32WriteMemory64 |
+            A32ExclusiveWriteMemory8 | A32ExclusiveWriteMemory16 |
+            A32ExclusiveWriteMemory32 | A32ExclusiveWriteMemory64
         )
     }
 
@@ -778,6 +862,35 @@ impl Opcode {
         matches!(self, Opcode::A64SetFPSR)
     }
 
+    /// Returns true if this is an A32-specific opcode.
+    pub fn is_a32_opcode(self) -> bool {
+        use Opcode::*;
+        matches!(self,
+            A32SetCheckBit | A32GetCFlag | A32GetRegister | A32SetRegister |
+            A32GetExtendedRegister32 | A32GetExtendedRegister64 |
+            A32SetExtendedRegister32 | A32SetExtendedRegister64 |
+            A32GetVector | A32SetVector |
+            A32GetCpsr | A32SetCpsr | A32SetCpsrNZCVRaw | A32SetCpsrNZCV |
+            A32SetCpsrNZCVQ | A32SetCpsrNZ | A32SetCpsrNZC |
+            A32OrQFlag | A32GetGEFlags | A32SetGEFlags | A32SetGEFlagsCompressed |
+            A32BXWritePC | A32UpdateUpperLocationDescriptor |
+            A32CallSupervisor | A32ExceptionRaised |
+            A32DataSynchronizationBarrier | A32DataMemoryBarrier |
+            A32InstructionSynchronizationBarrier |
+            A32GetFpscr | A32SetFpscr | A32GetFpscrNZCV | A32SetFpscrNZCV |
+            A32ClearExclusive |
+            A32ReadMemory8 | A32ReadMemory16 | A32ReadMemory32 | A32ReadMemory64 |
+            A32ExclusiveReadMemory8 | A32ExclusiveReadMemory16 |
+            A32ExclusiveReadMemory32 | A32ExclusiveReadMemory64 |
+            A32WriteMemory8 | A32WriteMemory16 | A32WriteMemory32 | A32WriteMemory64 |
+            A32ExclusiveWriteMemory8 | A32ExclusiveWriteMemory16 |
+            A32ExclusiveWriteMemory32 | A32ExclusiveWriteMemory64 |
+            A32CoprocInternalOperation | A32CoprocSendOneWord | A32CoprocSendTwoWords |
+            A32CoprocGetOneWord | A32CoprocGetTwoWords |
+            A32CoprocLoadWords | A32CoprocStoreWords
+        )
+    }
+
     fn info(self) -> OpcodeInfo {
         use Opcode::*;
         // Type aliases (avoiding glob import due to Void collision)
@@ -792,8 +905,11 @@ impl Opcode {
         const COND: Type = Type::Cond;
         const A64R: Type = Type::A64Reg;
         const A64V: Type = Type::A64Vec;
+        const A32R: Type = Type::A32Reg;
+        const A32E: Type = Type::A32ExtReg;
         const OPQ: Type = Type::Opaque;
         const ACC: Type = Type::AccType;
+        const COPROC: Type = Type::CoprocInfo;
         match self {
             // Core
             Void => OpcodeInfo { ret: V, args: &[] },
@@ -1267,6 +1383,68 @@ impl Opcode {
             A64ExclusiveWriteMemory32 => OpcodeInfo { ret: U32, args: &[U64, U64, U32, ACC] },
             A64ExclusiveWriteMemory64 => OpcodeInfo { ret: U32, args: &[U64, U64, U64, ACC] },
             A64ExclusiveWriteMemory128 => OpcodeInfo { ret: U32, args: &[U64, U64, U128, ACC] },
+
+            // A32 context
+            A32SetCheckBit => OpcodeInfo { ret: V, args: &[U1] },
+            A32GetCFlag => OpcodeInfo { ret: U1, args: &[] },
+            A32GetRegister => OpcodeInfo { ret: U32, args: &[A32R] },
+            A32SetRegister => OpcodeInfo { ret: V, args: &[A32R, U32] },
+            A32GetExtendedRegister32 => OpcodeInfo { ret: U32, args: &[A32E] },
+            A32GetExtendedRegister64 => OpcodeInfo { ret: U64, args: &[A32E] },
+            A32SetExtendedRegister32 => OpcodeInfo { ret: V, args: &[A32E, U32] },
+            A32SetExtendedRegister64 => OpcodeInfo { ret: V, args: &[A32E, U64] },
+            A32GetVector => OpcodeInfo { ret: U128, args: &[A32E] },
+            A32SetVector => OpcodeInfo { ret: V, args: &[A32E, U128] },
+            A32GetCpsr => OpcodeInfo { ret: U32, args: &[] },
+            A32SetCpsr => OpcodeInfo { ret: V, args: &[U32] },
+            A32SetCpsrNZCVRaw => OpcodeInfo { ret: V, args: &[U32] },
+            A32SetCpsrNZCV => OpcodeInfo { ret: V, args: &[NZCV] },
+            A32SetCpsrNZCVQ => OpcodeInfo { ret: V, args: &[U32] },
+            A32SetCpsrNZ => OpcodeInfo { ret: V, args: &[NZCV] },
+            A32SetCpsrNZC => OpcodeInfo { ret: V, args: &[NZCV, U1] },
+            A32OrQFlag => OpcodeInfo { ret: V, args: &[U1] },
+            A32GetGEFlags => OpcodeInfo { ret: U32, args: &[] },
+            A32SetGEFlags => OpcodeInfo { ret: V, args: &[U32] },
+            A32SetGEFlagsCompressed => OpcodeInfo { ret: V, args: &[U32] },
+            A32BXWritePC => OpcodeInfo { ret: V, args: &[U32] },
+            A32UpdateUpperLocationDescriptor => OpcodeInfo { ret: V, args: &[] },
+            A32CallSupervisor => OpcodeInfo { ret: V, args: &[U32] },
+            A32ExceptionRaised => OpcodeInfo { ret: V, args: &[U32, U64] },
+            A32DataSynchronizationBarrier => OpcodeInfo { ret: V, args: &[] },
+            A32DataMemoryBarrier => OpcodeInfo { ret: V, args: &[] },
+            A32InstructionSynchronizationBarrier => OpcodeInfo { ret: V, args: &[] },
+            A32GetFpscr => OpcodeInfo { ret: U32, args: &[] },
+            A32SetFpscr => OpcodeInfo { ret: V, args: &[U32] },
+            A32GetFpscrNZCV => OpcodeInfo { ret: U32, args: &[] },
+            A32SetFpscrNZCV => OpcodeInfo { ret: V, args: &[NZCV] },
+
+            // A32 Memory (location_descriptor passed as first arg)
+            A32ClearExclusive => OpcodeInfo { ret: V, args: &[] },
+            A32ReadMemory8 => OpcodeInfo { ret: U8, args: &[U64, U32, ACC] },
+            A32ReadMemory16 => OpcodeInfo { ret: U16, args: &[U64, U32, ACC] },
+            A32ReadMemory32 => OpcodeInfo { ret: U32, args: &[U64, U32, ACC] },
+            A32ReadMemory64 => OpcodeInfo { ret: U64, args: &[U64, U32, ACC] },
+            A32ExclusiveReadMemory8 => OpcodeInfo { ret: U8, args: &[U64, U32, ACC] },
+            A32ExclusiveReadMemory16 => OpcodeInfo { ret: U16, args: &[U64, U32, ACC] },
+            A32ExclusiveReadMemory32 => OpcodeInfo { ret: U32, args: &[U64, U32, ACC] },
+            A32ExclusiveReadMemory64 => OpcodeInfo { ret: U64, args: &[U64, U32, ACC] },
+            A32WriteMemory8 => OpcodeInfo { ret: V, args: &[U64, U32, U8, ACC] },
+            A32WriteMemory16 => OpcodeInfo { ret: V, args: &[U64, U32, U16, ACC] },
+            A32WriteMemory32 => OpcodeInfo { ret: V, args: &[U64, U32, U32, ACC] },
+            A32WriteMemory64 => OpcodeInfo { ret: V, args: &[U64, U32, U64, ACC] },
+            A32ExclusiveWriteMemory8 => OpcodeInfo { ret: U32, args: &[U64, U32, U8, ACC] },
+            A32ExclusiveWriteMemory16 => OpcodeInfo { ret: U32, args: &[U64, U32, U16, ACC] },
+            A32ExclusiveWriteMemory32 => OpcodeInfo { ret: U32, args: &[U64, U32, U32, ACC] },
+            A32ExclusiveWriteMemory64 => OpcodeInfo { ret: U32, args: &[U64, U32, U64, ACC] },
+
+            // A32 Coprocessor
+            A32CoprocInternalOperation => OpcodeInfo { ret: V, args: &[COPROC] },
+            A32CoprocSendOneWord => OpcodeInfo { ret: V, args: &[COPROC, U32] },
+            A32CoprocSendTwoWords => OpcodeInfo { ret: V, args: &[COPROC, U32, U32] },
+            A32CoprocGetOneWord => OpcodeInfo { ret: U32, args: &[COPROC] },
+            A32CoprocGetTwoWords => OpcodeInfo { ret: U64, args: &[COPROC] },
+            A32CoprocLoadWords => OpcodeInfo { ret: V, args: &[COPROC, U32, U1] },
+            A32CoprocStoreWords => OpcodeInfo { ret: V, args: &[COPROC, U32, U1] },
         }
     }
 }

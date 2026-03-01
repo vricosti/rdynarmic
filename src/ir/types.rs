@@ -5,6 +5,8 @@ use std::fmt;
 #[repr(u16)]
 pub enum Type {
     Void = 0,
+    A32Reg = 1 << 0,
+    A32ExtReg = 1 << 1,
     A64Reg = 1 << 2,
     A64Vec = 1 << 3,
     Opaque = 1 << 4,
@@ -14,6 +16,7 @@ pub enum Type {
     U32 = 1 << 8,
     U64 = 1 << 9,
     U128 = 1 << 10,
+    CoprocInfo = 1 << 11,
     NZCVFlags = 1 << 12,
     Cond = 1 << 13,
     Table = 1 << 14,
@@ -46,6 +49,8 @@ impl fmt::Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Type::Void => write!(f, "Void"),
+            Type::A32Reg => write!(f, "A32Reg"),
+            Type::A32ExtReg => write!(f, "A32ExtReg"),
             Type::A64Reg => write!(f, "A64Reg"),
             Type::A64Vec => write!(f, "A64Vec"),
             Type::Opaque => write!(f, "Opaque"),
@@ -55,6 +60,7 @@ impl fmt::Display for Type {
             Type::U32 => write!(f, "U32"),
             Type::U64 => write!(f, "U64"),
             Type::U128 => write!(f, "U128"),
+            Type::CoprocInfo => write!(f, "CoprocInfo"),
             Type::NZCVFlags => write!(f, "NZCVFlags"),
             Type::Cond => write!(f, "Cond"),
             Type::Table => write!(f, "Table"),

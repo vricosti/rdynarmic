@@ -52,7 +52,13 @@ pub fn translate(
             if let Some(decoded) = decode(instruction) {
                 should_continue = visitor.dispatch(&decoded);
             } else {
-                should_continue = visitor.interpret_this_instruction();
+                // Undecodable instruction — raise exception, matching C++ dynarmic.
+                // The C++ decoder covers all encoding groups; unallocated groups call
+                // UnallocatedEncoding() which raises ExceptionRaised.  Our decoder
+                // returns None instead, so treat it the same way.
+                should_continue = visitor.raise_exception(
+                    crate::frontend::a64::types::Exception::UnallocatedEncoding,
+                );
             }
         } else {
             should_continue = visitor.raise_exception(

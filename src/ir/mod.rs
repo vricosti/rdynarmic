@@ -9,6 +9,7 @@ pub mod cond;
 pub mod acc_type;
 pub mod emitter;
 pub mod a64_emitter;
+pub mod a32_emitter;
 pub mod opt;
 
 pub use opcode::Opcode;
@@ -17,8 +18,9 @@ pub use value::{Value, InstRef};
 pub use inst::Inst;
 pub use block::Block;
 pub use terminal::Terminal;
-pub use location::{LocationDescriptor, A64LocationDescriptor};
+pub use location::{LocationDescriptor, A64LocationDescriptor, A32LocationDescriptor};
 pub use cond::Cond;
 pub use acc_type::AccType;
 pub use emitter::IREmitter;
 pub use a64_emitter::A64IREmitter;
+pub use a32_emitter::A32IREmitter;

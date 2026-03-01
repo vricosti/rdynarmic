@@ -207,7 +207,7 @@ impl<'a> TranslatorVisitor<'a> {
     pub fn interpret_this_instruction(&mut self) -> bool {
         let loc = self.ir.current_location.expect("location not set");
         self.ir.set_term(Terminal::Interpret {
-            next: loc.to_location(),
+            next: loc.advance_pc(4).to_location(),
             num_instructions: 1,
         });
         false

@@ -749,12 +749,10 @@ pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockD
             Opcode::FPVectorToHalf32 => fpvc::emit_fp_vector_to_half32(ctx, ra, inst_ref, inst),
 
             // --- Not yet implemented ---
-            // Pseudo-ops that should not appear at emission time
-            Opcode::CallHostFunction
-            | Opcode::GetGEFromOp
-            | Opcode::SetInsertionPoint
-            | Opcode::GetInsertionPoint => {
-                panic!("Opcode {:?} should not appear at emission time", inst.opcode);
+            // Pseudo-ops that should not appear at emission time, and
+            // A32 opcodes (handled by A32EmitX64, not the A64 emission pipeline).
+            _ => {
+                panic!("Opcode {:?} should not appear in A64 emission pipeline", inst.opcode);
             }
         }
 

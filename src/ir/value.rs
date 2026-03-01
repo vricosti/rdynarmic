@@ -1,6 +1,7 @@
 use std::fmt;
 
 use crate::frontend::a64::types::{Reg as A64Reg, Vec as A64Vec};
+use crate::frontend::a32::types::{Reg as A32Reg, ExtReg as A32ExtReg};
 use crate::ir::acc_type::AccType;
 use crate::ir::cond::Cond;
 use crate::ir::types::Type;
@@ -33,6 +34,9 @@ pub enum Value {
     ImmU64(u64),
     ImmA64Reg(A64Reg),
     ImmA64Vec(A64Vec),
+    ImmA32Reg(A32Reg),
+    ImmA32ExtReg(A32ExtReg),
+    ImmCoprocInfo(u64),
     ImmCond(Cond),
     ImmAccType(AccType),
 }
@@ -50,6 +54,9 @@ impl Value {
             Value::ImmU64(_) => Type::U64,
             Value::ImmA64Reg(_) => Type::A64Reg,
             Value::ImmA64Vec(_) => Type::A64Vec,
+            Value::ImmA32Reg(_) => Type::A32Reg,
+            Value::ImmA32ExtReg(_) => Type::A32ExtReg,
+            Value::ImmCoprocInfo(_) => Type::CoprocInfo,
             Value::ImmCond(_) => Type::Cond,
             Value::ImmAccType(_) => Type::AccType,
         }
@@ -58,6 +65,27 @@ impl Value {
     /// Returns true if this is an immediate value (not an instruction reference).
     pub fn is_immediate(&self) -> bool {
         !matches!(self, Value::Inst(_) | Value::Void)
+    }
+
+    pub fn get_a32_reg(&self) -> A32Reg {
+        match self {
+            Value::ImmA32Reg(r) => *r,
+            _ => panic!("Value::get_a32_reg called on {:?}", self),
+        }
+    }
+
+    pub fn get_a32_ext_reg(&self) -> A32ExtReg {
+        match self {
+            Value::ImmA32ExtReg(r) => *r,
+            _ => panic!("Value::get_a32_ext_reg called on {:?}", self),
+        }
+    }
+
+    pub fn get_coproc_info(&self) -> u64 {
+        match self {
+            Value::ImmCoprocInfo(v) => *v,
+            _ => panic!("Value::get_coproc_info called on {:?}", self),
+        }
     }
 
     /// Returns true if this is a reference to an instruction.
@@ -211,6 +239,9 @@ impl fmt::Display for Value {
             Value::ImmU64(v) => write!(f, "#{:#x}", v),
             Value::ImmA64Reg(r) => write!(f, "{}", r),
             Value::ImmA64Vec(v) => write!(f, "{}", v),
+            Value::ImmA32Reg(r) => write!(f, "{}", r),
+            Value::ImmA32ExtReg(r) => write!(f, "{}", r),
+            Value::ImmCoprocInfo(v) => write!(f, "coproc:{:#x}", v),
             Value::ImmCond(c) => write!(f, "{}", c),
             Value::ImmAccType(a) => write!(f, "{}", a),
         }
@@ -237,6 +268,12 @@ impl From<A64Reg> for Value {
 }
 impl From<A64Vec> for Value {
     fn from(v: A64Vec) -> Self { Value::ImmA64Vec(v) }
+}
+impl From<A32Reg> for Value {
+    fn from(r: A32Reg) -> Self { Value::ImmA32Reg(r) }
+}
+impl From<A32ExtReg> for Value {
+    fn from(r: A32ExtReg) -> Self { Value::ImmA32ExtReg(r) }
 }
 impl From<Cond> for Value {
     fn from(c: Cond) -> Self { Value::ImmCond(c) }
