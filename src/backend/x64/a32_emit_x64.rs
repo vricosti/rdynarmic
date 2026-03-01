@@ -18,6 +18,7 @@ use crate::frontend::a32::translate::translate as a32_translate;
 use crate::ir::location::{A32LocationDescriptor, LocationDescriptor};
 use crate::ir::opt;
 use crate::ir::types::Type;
+use crate::jit_config::OptimizationFlag;
 
 /// Minimum space remaining in the code buffer before triggering a cache clear.
 const MIN_SPACE_REMAINING: usize = 1024 * 1024; // 1 MB
@@ -41,21 +42,19 @@ pub struct A32EmitX64 {
     pub cache: BlockCache,
     pub dispatcher_labels: DispatcherLabels,
     pub emit_config: EmitConfig,
-    pub enable_optimizations: bool,
+    /// Fine-grained optimization flags (replaces separate booleans).
+    pub optimizations: OptimizationFlag,
     pub patch_table: PatchTable,
-    pub enable_block_linking: bool,
     pub terminal_handler_pop_rsb_hint: Option<usize>,
     pub terminal_handler_fast_dispatch_hint: Option<usize>,
     pub fast_dispatch_table: Option<Box<[FastDispatchEntry]>>,
-    pub enable_rsb: bool,
-    pub enable_fast_dispatch: bool,
 }
 
 impl A32EmitX64 {
     pub fn new(
         emit_config: EmitConfig,
         run_callbacks: RunCodeCallbacks,
-        enable_optimizations: bool,
+        optimizations: OptimizationFlag,
         cache_size: usize,
     ) -> Result<Self, String> {
         let mut code = BlockOfCode::with_size_and_offsets(cache_size, JitStateOffsets {
@@ -72,14 +71,11 @@ impl A32EmitX64 {
             cache: BlockCache::new(),
             dispatcher_labels,
             emit_config,
-            enable_optimizations,
+            optimizations,
             patch_table: PatchTable::new(),
-            enable_block_linking: true,
             terminal_handler_pop_rsb_hint: None,
             terminal_handler_fast_dispatch_hint: None,
             fast_dispatch_table: None,
-            enable_rsb: true,
-            enable_fast_dispatch: true,
         };
 
         emitter.gen_terminal_handlers()?;
@@ -131,10 +127,12 @@ impl A32EmitX64 {
         let a32_loc = A32LocationDescriptor::from_location(location);
         let mut block = a32_translate(a32_loc, read_code);
 
-        // Optimize
-        if self.enable_optimizations {
+        // Optimize (per-flag, matching dynarmic — no MiscIROpt for A32)
+        if self.optimizations.contains(OptimizationFlag::GET_SET_ELIMINATION) {
             opt::a32_get_set_elimination(&mut block);
             opt::dead_code_elimination(&mut block);
+        }
+        if self.optimizations.contains(OptimizationFlag::CONST_PROP) {
             opt::constant_propagation(&mut block);
             opt::dead_code_elimination(&mut block);
         }
@@ -152,13 +150,13 @@ impl A32EmitX64 {
                 self.dispatcher_labels.return_from_run_code,
                 self.code.code_base_ptr(),
             );
-            ctx.enable_block_linking = self.enable_block_linking;
-            ctx.enable_rsb = self.enable_rsb;
-            ctx.enable_fast_dispatch = self.enable_fast_dispatch;
+            ctx.enable_block_linking = self.optimizations.contains(OptimizationFlag::BLOCK_LINKING);
+            ctx.enable_rsb = self.optimizations.contains(OptimizationFlag::RETURN_STACK_BUFFER);
+            ctx.enable_fast_dispatch = self.optimizations.contains(OptimizationFlag::FAST_DISPATCH);
             ctx.terminal_handler_pop_rsb_hint = self.terminal_handler_pop_rsb_hint;
             ctx.terminal_handler_fast_dispatch_hint = self.terminal_handler_fast_dispatch_hint;
 
-            if self.enable_block_linking {
+            if self.optimizations.contains(OptimizationFlag::BLOCK_LINKING) {
                 let cache_ptr = &self.cache as *const BlockCache;
                 ctx.block_lookup = Some(Box::new(move |loc| {
                     let cache = unsafe { &*cache_ptr };

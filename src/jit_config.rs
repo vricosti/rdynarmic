@@ -73,7 +73,86 @@ pub trait JitCallbacks: Send {
     fn get_ticks_remaining(&self) -> u64;
 }
 
-/// Configuration for creating an A64Jit instance.
+/// Fine-grained optimization flags matching dynarmic's `OptimizationFlag`.
+///
+/// Safe optimizations occupy the low 16 bits; unsafe ones occupy the high bits.
+/// Use bitwise OR to combine flags.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OptimizationFlag(u32);
+
+impl OptimizationFlag {
+    // -- Safe optimizations ---------------------------------------------------
+
+    /// Direct jmp patching between compiled blocks.
+    pub const BLOCK_LINKING: Self = Self(0x0000_0001);
+    /// Return stack buffer prediction cache for returns.
+    pub const RETURN_STACK_BUFFER: Self = Self(0x0000_0002);
+    /// Hash-table MRU cache dispatch.
+    pub const FAST_DISPATCH: Self = Self(0x0000_0004);
+    /// GetSetElimination IR pass.
+    pub const GET_SET_ELIMINATION: Self = Self(0x0000_0008);
+    /// ConstantPropagation IR pass.
+    pub const CONST_PROP: Self = Self(0x0000_0010);
+    /// Miscellaneous IR optimizations (A64 merge-interpret-blocks).
+    pub const MISC_IR_OPT: Self = Self(0x0000_0020);
+
+    // -- Unsafe optimizations -------------------------------------------------
+
+    pub const UNSAFE_UNFUSE_FMA: Self = Self(0x0001_0000);
+    pub const UNSAFE_REDUCED_ERROR_FP: Self = Self(0x0002_0000);
+    pub const UNSAFE_INACCURATE_NAN: Self = Self(0x0004_0000);
+    pub const UNSAFE_IGNORE_STANDARD_FPCR_VALUE: Self = Self(0x0008_0000);
+    pub const UNSAFE_IGNORE_GLOBAL_MONITOR: Self = Self(0x0010_0000);
+
+    // -- Convenience constants ------------------------------------------------
+
+    /// No optimizations enabled.
+    pub const NO_OPTIMIZATIONS: Self = Self(0);
+    /// All safe optimizations enabled (low 16 bits).
+    pub const ALL_SAFE_OPTIMIZATIONS: Self = Self(0x0000_FFFF);
+
+    /// Returns true if `flag` is set within `self`.
+    #[inline]
+    pub fn contains(self, flag: Self) -> bool {
+        (self.0 & flag.0) == flag.0 && flag.0 != 0
+    }
+
+    /// Raw bits.
+    #[inline]
+    pub fn bits(self) -> u32 {
+        self.0
+    }
+}
+
+impl std::ops::BitOr for OptimizationFlag {
+    type Output = Self;
+    #[inline]
+    fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) }
+}
+
+impl std::ops::BitOrAssign for OptimizationFlag {
+    #[inline]
+    fn bitor_assign(&mut self, rhs: Self) { self.0 |= rhs.0; }
+}
+
+impl std::ops::BitAnd for OptimizationFlag {
+    type Output = Self;
+    #[inline]
+    fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) }
+}
+
+impl std::ops::BitAndAssign for OptimizationFlag {
+    #[inline]
+    fn bitand_assign(&mut self, rhs: Self) { self.0 &= rhs.0; }
+}
+
+impl std::ops::Not for OptimizationFlag {
+    type Output = Self;
+    #[inline]
+    fn not(self) -> Self { Self(!self.0) }
+}
+
+/// Configuration for creating an A64Jit / A32Jit instance.
 pub struct JitConfig {
     /// Host callbacks for memory access, system calls, and tick counting.
     pub callbacks: Box<dyn JitCallbacks>,
@@ -81,11 +160,25 @@ pub struct JitConfig {
     pub enable_cycle_counting: bool,
     /// Code cache size in bytes (default: 128 MB).
     pub code_cache_size: usize,
-    /// Whether IR optimization passes are enabled.
-    pub enable_optimizations: bool,
+    /// Which optimization passes and runtime features are enabled.
+    pub optimizations: OptimizationFlag,
+    /// Whether unsafe optimizations are permitted.
+    pub unsafe_optimizations: bool,
 }
 
 impl JitConfig {
     /// Default code cache size: 128 MB.
     pub const DEFAULT_CODE_CACHE_SIZE: usize = 128 * 1024 * 1024;
+
+    /// Check whether a specific optimization flag is active.
+    ///
+    /// Unsafe flags are masked out unless `unsafe_optimizations` is true,
+    /// matching dynarmic's `HasOptimization()`.
+    pub fn has_optimization(&self, flag: OptimizationFlag) -> bool {
+        let mut f = flag;
+        if !self.unsafe_optimizations {
+            f = f & OptimizationFlag::ALL_SAFE_OPTIMIZATIONS;
+        }
+        (f & self.optimizations) != OptimizationFlag::NO_OPTIMIZATIONS
+    }
 }

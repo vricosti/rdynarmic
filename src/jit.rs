@@ -9,7 +9,7 @@ use crate::backend::x64::jit_state::{A32JitState, A64JitState};
 use crate::frontend::a64::translate::TranslationOptions;
 use crate::halt_reason::HaltReason;
 use crate::ir::location::LocationDescriptor;
-use crate::jit_config::{JitCallbacks, JitConfig};
+use crate::jit_config::{JitCallbacks, JitConfig, OptimizationFlag};
 
 /// Public ARM64 JIT compiler.
 ///
@@ -112,7 +112,7 @@ impl A64Jit {
             emit_config,
             run_callbacks,
             translation_options,
-            config.enable_optimizations,
+            config.optimizations,
             cache_size,
         )?;
 
@@ -590,7 +590,7 @@ impl A32Jit {
         let mut emitter = A32EmitX64::new(
             emit_config,
             run_callbacks,
-            config.enable_optimizations,
+            config.optimizations,
             cache_size,
         )?;
 
@@ -1028,7 +1028,8 @@ mod tests {
             callbacks: Box::new(MockCallbacks::new(0x1000, &[0xD4000001])),
             enable_cycle_counting: true,
             code_cache_size: 4 * 1024 * 1024, // 4 MB for tests
-            enable_optimizations: true,
+            optimizations: OptimizationFlag::ALL_SAFE_OPTIMIZATIONS,
+            unsafe_optimizations: false,
         };
         let jit = A64Jit::new(config);
         assert!(jit.is_ok(), "JIT creation failed: {:?}", jit.err());
@@ -1040,7 +1041,8 @@ mod tests {
             callbacks: Box::new(MockCallbacks::new(0x1000, &[])),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
-            enable_optimizations: false,
+            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
+            unsafe_optimizations: false,
         };
         let mut jit = A64Jit::new(config).unwrap();
 
@@ -1069,7 +1071,8 @@ mod tests {
             callbacks: Box::new(MockCallbacks::new(0x1000, &[])),
             enable_cycle_counting: false,
             code_cache_size: 4 * 1024 * 1024,
-            enable_optimizations: false,
+            optimizations: OptimizationFlag::NO_OPTIMIZATIONS,
+            unsafe_optimizations: false,
         };
         let jit = A64Jit::new(config).unwrap();
 

@@ -7,3 +7,4 @@ pub mod jit;
 
 pub use jit::A64Jit;
 pub use jit::A32Jit;
+pub use jit_config::OptimizationFlag;

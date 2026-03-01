@@ -12,6 +12,7 @@ use crate::frontend::a64::translate::{translate, MemoryReadCodeFn, TranslationOp
 use crate::ir::location::{A64LocationDescriptor, LocationDescriptor};
 use crate::ir::opt;
 use crate::ir::types::Type;
+use crate::jit_config::OptimizationFlag;
 
 /// Minimum space remaining in the code buffer before triggering a cache clear.
 const MIN_SPACE_REMAINING: usize = 1024 * 1024; // 1 MB
@@ -38,21 +39,16 @@ pub struct A64EmitX64 {
     pub dispatcher_labels: DispatcherLabels,
     pub emit_config: EmitConfig,
     pub translation_options: TranslationOptions,
-    pub enable_optimizations: bool,
+    /// Fine-grained optimization flags (replaces separate booleans).
+    pub optimizations: OptimizationFlag,
     /// Block linking: maps target location → patch slots pointing at it.
     pub patch_table: PatchTable,
-    /// Whether block linking is enabled.
-    pub enable_block_linking: bool,
     /// Code buffer offset of the PopRSBHint terminal handler.
     pub terminal_handler_pop_rsb_hint: Option<usize>,
     /// Code buffer offset of the FastDispatchHint terminal handler.
     pub terminal_handler_fast_dispatch_hint: Option<usize>,
     /// Fast dispatch hash table (heap-allocated, stable pointer).
     pub fast_dispatch_table: Option<Box<[FastDispatchEntry]>>,
-    /// Whether RSB is enabled.
-    pub enable_rsb: bool,
-    /// Whether fast dispatch is enabled.
-    pub enable_fast_dispatch: bool,
 }
 
 impl A64EmitX64 {
@@ -61,7 +57,7 @@ impl A64EmitX64 {
         emit_config: EmitConfig,
         run_callbacks: RunCodeCallbacks,
         translation_options: TranslationOptions,
-        enable_optimizations: bool,
+        optimizations: OptimizationFlag,
         cache_size: usize,
     ) -> Result<Self, String> {
         let mut code = BlockOfCode::with_size_and_offsets(cache_size, JitStateOffsets {
@@ -79,14 +75,11 @@ impl A64EmitX64 {
             dispatcher_labels,
             emit_config,
             translation_options,
-            enable_optimizations,
+            optimizations,
             patch_table: PatchTable::new(),
-            enable_block_linking: true,
             terminal_handler_pop_rsb_hint: None,
             terminal_handler_fast_dispatch_hint: None,
             fast_dispatch_table: None,
-            enable_rsb: true,
-            enable_fast_dispatch: true,
         };
 
         // Generate prelude handlers for RSB and fast dispatch
@@ -148,12 +141,16 @@ impl A64EmitX64 {
         let a64_loc = A64LocationDescriptor::from_location(location);
         let mut block = translate(a64_loc, read_code, self.translation_options.clone());
 
-        // Optimize
-        if self.enable_optimizations {
+        // Optimize (per-flag, matching dynarmic)
+        if self.optimizations.contains(OptimizationFlag::GET_SET_ELIMINATION) {
             opt::a64_get_set_elimination(&mut block);
             opt::dead_code_elimination(&mut block);
+        }
+        if self.optimizations.contains(OptimizationFlag::CONST_PROP) {
             opt::constant_propagation(&mut block);
             opt::dead_code_elimination(&mut block);
+        }
+        if self.optimizations.contains(OptimizationFlag::MISC_IR_OPT) {
             opt::a64_merge_interpret_blocks(&mut block);
         }
 
@@ -171,14 +168,14 @@ impl A64EmitX64 {
                 self.dispatcher_labels.return_from_run_code,
                 self.code.code_base_ptr(),
             );
-            ctx.enable_block_linking = self.enable_block_linking;
-            ctx.enable_rsb = self.enable_rsb;
-            ctx.enable_fast_dispatch = self.enable_fast_dispatch;
+            ctx.enable_block_linking = self.optimizations.contains(OptimizationFlag::BLOCK_LINKING);
+            ctx.enable_rsb = self.optimizations.contains(OptimizationFlag::RETURN_STACK_BUFFER);
+            ctx.enable_fast_dispatch = self.optimizations.contains(OptimizationFlag::FAST_DISPATCH);
             ctx.terminal_handler_pop_rsb_hint = self.terminal_handler_pop_rsb_hint;
             ctx.terminal_handler_fast_dispatch_hint = self.terminal_handler_fast_dispatch_hint;
 
             // Set up block lookup closure for checking if targets are already compiled
-            if self.enable_block_linking {
+            if self.optimizations.contains(OptimizationFlag::BLOCK_LINKING) {
                 let cache_ptr = &self.cache as *const BlockCache;
                 ctx.block_lookup = Some(Box::new(move |loc| {
                     let cache = unsafe { &*cache_ptr };
@@ -605,7 +602,7 @@ mod tests {
         };
         let run_callbacks = make_test_callbacks();
         let translation_options = crate::frontend::a64::translate::TranslationOptions::default();
-        let emitter = A64EmitX64::new(emit_config, run_callbacks, translation_options, true, 4 * 1024 * 1024).unwrap();
+        let emitter = A64EmitX64::new(emit_config, run_callbacks, translation_options, OptimizationFlag::ALL_SAFE_OPTIMIZATIONS, 4 * 1024 * 1024).unwrap();
 
         assert!(emitter.terminal_handler_pop_rsb_hint.is_some(),
             "RSB handler should be generated");
@@ -654,7 +651,7 @@ mod tests {
         };
         let run_callbacks = make_test_callbacks();
         let translation_options = crate::frontend::a64::translate::TranslationOptions::default();
-        let emitter = A64EmitX64::new(emit_config, run_callbacks, translation_options, true, 4 * 1024 * 1024).unwrap();
+        let emitter = A64EmitX64::new(emit_config, run_callbacks, translation_options, OptimizationFlag::ALL_SAFE_OPTIMIZATIONS, 4 * 1024 * 1024).unwrap();
 
         assert!(emitter.fast_dispatch_table.is_some(), "Fast dispatch table should be allocated");
         let table = emitter.fast_dispatch_table.as_ref().unwrap();
