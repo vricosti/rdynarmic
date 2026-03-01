@@ -1,5 +1,6 @@
 use crate::backend::x64::emit_context::{BlockDescriptor, EmitContext};
 use crate::backend::x64::emit_a64;
+use crate::backend::x64::a32_emit_a32 as a32;
 use crate::backend::x64::emit_data_processing as dp;
 use crate::backend::x64::emit_memory;
 use crate::backend::x64::emit_exclusive_memory as excl_mem;
@@ -748,11 +749,71 @@ pub fn emit_block(ctx: &EmitContext, ra: &mut RegAlloc, block: &Block) -> BlockD
             Opcode::FPVectorFromHalf32 => fpvc::emit_fp_vector_from_half32(ctx, ra, inst_ref, inst),
             Opcode::FPVectorToHalf32 => fpvc::emit_fp_vector_to_half32(ctx, ra, inst_ref, inst),
 
+            // --- A32 context getters/setters ---
+            Opcode::A32SetCheckBit => a32::emit_a32_set_check_bit(ctx, ra, inst_ref, inst),
+            Opcode::A32GetCFlag => a32::emit_a32_get_c_flag(ctx, ra, inst_ref, inst),
+            Opcode::A32GetRegister => a32::emit_a32_get_register(ctx, ra, inst_ref, inst),
+            Opcode::A32SetRegister => a32::emit_a32_set_register(ctx, ra, inst_ref, inst),
+            Opcode::A32GetExtendedRegister32 => a32::emit_a32_get_extended_register32(ctx, ra, inst_ref, inst),
+            Opcode::A32GetExtendedRegister64 => a32::emit_a32_get_extended_register64(ctx, ra, inst_ref, inst),
+            Opcode::A32SetExtendedRegister32 => a32::emit_a32_set_extended_register32(ctx, ra, inst_ref, inst),
+            Opcode::A32SetExtendedRegister64 => a32::emit_a32_set_extended_register64(ctx, ra, inst_ref, inst),
+            Opcode::A32GetVector => a32::emit_a32_get_vector(ctx, ra, inst_ref, inst),
+            Opcode::A32SetVector => a32::emit_a32_set_vector(ctx, ra, inst_ref, inst),
+            Opcode::A32GetCpsr => a32::emit_a32_get_cpsr(ctx, ra, inst_ref, inst),
+            Opcode::A32SetCpsr => a32::emit_a32_set_cpsr(ctx, ra, inst_ref, inst),
+            Opcode::A32SetCpsrNZCVRaw => a32::emit_a32_set_cpsr_nzcv_raw(ctx, ra, inst_ref, inst),
+            Opcode::A32SetCpsrNZCV => a32::emit_a32_set_cpsr_nzcv(ctx, ra, inst_ref, inst),
+            Opcode::A32SetCpsrNZCVQ => a32::emit_a32_set_cpsr_nzcvq(ctx, ra, inst_ref, inst),
+            Opcode::A32SetCpsrNZ => a32::emit_a32_set_cpsr_nz(ctx, ra, inst_ref, inst),
+            Opcode::A32SetCpsrNZC => a32::emit_a32_set_cpsr_nzc(ctx, ra, inst_ref, inst),
+            Opcode::A32OrQFlag => a32::emit_a32_or_q_flag(ctx, ra, inst_ref, inst),
+            Opcode::A32GetGEFlags => a32::emit_a32_get_ge_flags(ctx, ra, inst_ref, inst),
+            Opcode::A32SetGEFlags => a32::emit_a32_set_ge_flags(ctx, ra, inst_ref, inst),
+            Opcode::A32SetGEFlagsCompressed => a32::emit_a32_set_ge_flags_compressed(ctx, ra, inst_ref, inst),
+            Opcode::A32BXWritePC => a32::emit_a32_bx_write_pc(ctx, ra, inst_ref, inst),
+            Opcode::A32UpdateUpperLocationDescriptor => a32::emit_a32_update_upper_location_descriptor(ctx, ra, inst_ref, inst),
+            Opcode::A32CallSupervisor => a32::emit_a32_call_supervisor(ctx, ra, inst_ref, inst),
+            Opcode::A32ExceptionRaised => a32::emit_a32_exception_raised(ctx, ra, inst_ref, inst),
+            Opcode::A32DataSynchronizationBarrier => a32::emit_a32_dsb(ctx, ra, inst_ref, inst),
+            Opcode::A32DataMemoryBarrier => a32::emit_a32_dmb(ctx, ra, inst_ref, inst),
+            Opcode::A32InstructionSynchronizationBarrier => a32::emit_a32_isb(ctx, ra, inst_ref, inst),
+            Opcode::A32GetFpscr => a32::emit_a32_get_fpscr(ctx, ra, inst_ref, inst),
+            Opcode::A32SetFpscr => a32::emit_a32_set_fpscr(ctx, ra, inst_ref, inst),
+            Opcode::A32GetFpscrNZCV => a32::emit_a32_get_fpscr_nzcv(ctx, ra, inst_ref, inst),
+            Opcode::A32SetFpscrNZCV => a32::emit_a32_set_fpscr_nzcv(ctx, ra, inst_ref, inst),
+
+            // --- A32 Memory ---
+            Opcode::A32ClearExclusive => a32::emit_a32_clear_exclusive(ctx, ra, inst_ref, inst),
+            Opcode::A32ReadMemory8 => a32::emit_a32_read_memory_8(ctx, ra, inst_ref, inst),
+            Opcode::A32ReadMemory16 => a32::emit_a32_read_memory_16(ctx, ra, inst_ref, inst),
+            Opcode::A32ReadMemory32 => a32::emit_a32_read_memory_32(ctx, ra, inst_ref, inst),
+            Opcode::A32ReadMemory64 => a32::emit_a32_read_memory_64(ctx, ra, inst_ref, inst),
+            Opcode::A32ExclusiveReadMemory8 => a32::emit_a32_exclusive_read_memory_8(ctx, ra, inst_ref, inst),
+            Opcode::A32ExclusiveReadMemory16 => a32::emit_a32_exclusive_read_memory_16(ctx, ra, inst_ref, inst),
+            Opcode::A32ExclusiveReadMemory32 => a32::emit_a32_exclusive_read_memory_32(ctx, ra, inst_ref, inst),
+            Opcode::A32ExclusiveReadMemory64 => a32::emit_a32_exclusive_read_memory_64(ctx, ra, inst_ref, inst),
+            Opcode::A32WriteMemory8 => a32::emit_a32_write_memory_8(ctx, ra, inst_ref, inst),
+            Opcode::A32WriteMemory16 => a32::emit_a32_write_memory_16(ctx, ra, inst_ref, inst),
+            Opcode::A32WriteMemory32 => a32::emit_a32_write_memory_32(ctx, ra, inst_ref, inst),
+            Opcode::A32WriteMemory64 => a32::emit_a32_write_memory_64(ctx, ra, inst_ref, inst),
+            Opcode::A32ExclusiveWriteMemory8 => a32::emit_a32_exclusive_write_memory_8(ctx, ra, inst_ref, inst),
+            Opcode::A32ExclusiveWriteMemory16 => a32::emit_a32_exclusive_write_memory_16(ctx, ra, inst_ref, inst),
+            Opcode::A32ExclusiveWriteMemory32 => a32::emit_a32_exclusive_write_memory_32(ctx, ra, inst_ref, inst),
+            Opcode::A32ExclusiveWriteMemory64 => a32::emit_a32_exclusive_write_memory_64(ctx, ra, inst_ref, inst),
+
+            // --- A32 Coprocessor (stubs) ---
+            Opcode::A32CoprocInternalOperation => a32::emit_a32_coproc_internal_operation(ctx, ra, inst_ref, inst),
+            Opcode::A32CoprocSendOneWord => a32::emit_a32_coproc_send_one_word(ctx, ra, inst_ref, inst),
+            Opcode::A32CoprocSendTwoWords => a32::emit_a32_coproc_send_two_words(ctx, ra, inst_ref, inst),
+            Opcode::A32CoprocGetOneWord => a32::emit_a32_coproc_get_one_word(ctx, ra, inst_ref, inst),
+            Opcode::A32CoprocGetTwoWords => a32::emit_a32_coproc_get_two_words(ctx, ra, inst_ref, inst),
+            Opcode::A32CoprocLoadWords => a32::emit_a32_coproc_load_words(ctx, ra, inst_ref, inst),
+            Opcode::A32CoprocStoreWords => a32::emit_a32_coproc_store_words(ctx, ra, inst_ref, inst),
+
             // --- Not yet implemented ---
-            // Pseudo-ops that should not appear at emission time, and
-            // A32 opcodes (handled by A32EmitX64, not the A64 emission pipeline).
             _ => {
-                panic!("Opcode {:?} should not appear in A64 emission pipeline", inst.opcode);
+                panic!("Opcode {:?} not handled in emission pipeline", inst.opcode);
             }
         }
 

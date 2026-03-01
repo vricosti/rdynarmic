@@ -1,10 +1,11 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::backend::x64::a64_emit_x64::A64EmitX64;
+use crate::backend::x64::a32_emit_x64::A32EmitX64;
 use crate::backend::x64::block_of_code::{RunCodeCallbacks, RunCodeFn, DEFAULT_CODE_SIZE};
 use crate::backend::x64::callback::ArgCallback;
 use crate::backend::x64::emit_context::{EmitCallbacks, EmitConfig};
-use crate::backend::x64::jit_state::A64JitState;
+use crate::backend::x64::jit_state::{A32JitState, A64JitState};
 use crate::frontend::a64::translate::TranslationOptions;
 use crate::halt_reason::HaltReason;
 use crate::ir::location::LocationDescriptor;
@@ -492,6 +493,408 @@ extern "C" fn exclusive_write_64_trampoline(inner_ptr: u64, vaddr: u64, value: u
 
 extern "C" fn exclusive_write_128_trampoline(inner_ptr: u64, vaddr: u64, value_lo: u64, value_hi: u64) -> u64 {
     let inner = unsafe { &mut *(inner_ptr as *mut JitInner) };
+    if inner.callbacks.exclusive_write_128(vaddr, value_lo, value_hi) { 0 } else { 1 }
+}
+
+// ===========================================================================
+// A32 JIT
+// ===========================================================================
+
+/// Public ARM32 JIT compiler.
+///
+/// Same design as `A64Jit` but uses A32 frontend (ARM/Thumb decoder),
+/// A32JitState (16 × u32 GPRs, split CPSR, ext_reg array), and
+/// A32EmitX64 compilation pipeline.
+pub struct A32Jit {
+    inner: Box<A32JitInner>,
+}
+
+struct A32JitInner {
+    jit_state: A32JitState,
+    emitter: Option<A32EmitX64>,
+    callbacks: Box<dyn JitCallbacks>,
+    run_code_fn: Option<RunCodeFn>,
+    is_executing: bool,
+}
+
+impl A32Jit {
+    /// Create a new A32Jit from the given configuration.
+    pub fn new(config: JitConfig) -> Result<Self, String> {
+        let cache_size = if config.code_cache_size > 0 {
+            config.code_cache_size
+        } else {
+            DEFAULT_CODE_SIZE
+        };
+
+        let mut inner = Box::new(A32JitInner {
+            jit_state: A32JitState::new(),
+            emitter: None,
+            callbacks: config.callbacks,
+            run_code_fn: None,
+            is_executing: false,
+        });
+
+        let inner_ptr = &mut *inner as *mut A32JitInner as u64;
+
+        let run_callbacks = RunCodeCallbacks {
+            lookup_block: Box::new(ArgCallback::new(
+                a32_lookup_block_trampoline as usize as u64,
+                inner_ptr,
+            )),
+            add_ticks: Box::new(ArgCallback::new(
+                add_ticks_trampoline as usize as u64,
+                inner_ptr,
+            )),
+            get_ticks_remaining: Box::new(ArgCallback::new(
+                get_ticks_remaining_trampoline as usize as u64,
+                inner_ptr,
+            )),
+            enable_cycle_counting: config.enable_cycle_counting,
+        };
+
+        let emit_callbacks = EmitCallbacks {
+            memory_read_8: Box::new(ArgCallback::new(a32_memory_read_8_trampoline as usize as u64, inner_ptr)),
+            memory_read_16: Box::new(ArgCallback::new(a32_memory_read_16_trampoline as usize as u64, inner_ptr)),
+            memory_read_32: Box::new(ArgCallback::new(a32_memory_read_32_trampoline as usize as u64, inner_ptr)),
+            memory_read_64: Box::new(ArgCallback::new(a32_memory_read_64_trampoline as usize as u64, inner_ptr)),
+            memory_read_128: Box::new(ArgCallback::new(a32_memory_read_128_trampoline as usize as u64, inner_ptr)),
+            memory_write_8: Box::new(ArgCallback::new(a32_memory_write_8_trampoline as usize as u64, inner_ptr)),
+            memory_write_16: Box::new(ArgCallback::new(a32_memory_write_16_trampoline as usize as u64, inner_ptr)),
+            memory_write_32: Box::new(ArgCallback::new(a32_memory_write_32_trampoline as usize as u64, inner_ptr)),
+            memory_write_64: Box::new(ArgCallback::new(a32_memory_write_64_trampoline as usize as u64, inner_ptr)),
+            memory_write_128: Box::new(ArgCallback::new(a32_memory_write_128_trampoline as usize as u64, inner_ptr)),
+            call_supervisor: Box::new(ArgCallback::new(a32_call_supervisor_trampoline as usize as u64, inner_ptr)),
+            exception_raised: Box::new(ArgCallback::new(a32_exception_raised_trampoline as usize as u64, inner_ptr)),
+            data_cache_operation: Box::new(ArgCallback::new(a32_data_cache_op_trampoline as usize as u64, inner_ptr)),
+            instruction_cache_operation: Box::new(ArgCallback::new(a32_instruction_cache_op_trampoline as usize as u64, inner_ptr)),
+            add_ticks: Box::new(ArgCallback::new(a32_add_ticks_trampoline as usize as u64, inner_ptr)),
+            get_ticks_remaining: Box::new(ArgCallback::new(a32_get_ticks_remaining_trampoline as usize as u64, inner_ptr)),
+            exclusive_clear: Box::new(ArgCallback::new(a32_exclusive_clear_trampoline as usize as u64, inner_ptr)),
+            exclusive_read_8: Box::new(ArgCallback::new(a32_exclusive_read_8_trampoline as usize as u64, inner_ptr)),
+            exclusive_read_16: Box::new(ArgCallback::new(a32_exclusive_read_16_trampoline as usize as u64, inner_ptr)),
+            exclusive_read_32: Box::new(ArgCallback::new(a32_exclusive_read_32_trampoline as usize as u64, inner_ptr)),
+            exclusive_read_64: Box::new(ArgCallback::new(a32_exclusive_read_64_trampoline as usize as u64, inner_ptr)),
+            exclusive_read_128: Box::new(ArgCallback::new(a32_exclusive_read_128_trampoline as usize as u64, inner_ptr)),
+            exclusive_write_8: Box::new(ArgCallback::new(a32_exclusive_write_8_trampoline as usize as u64, inner_ptr)),
+            exclusive_write_16: Box::new(ArgCallback::new(a32_exclusive_write_16_trampoline as usize as u64, inner_ptr)),
+            exclusive_write_32: Box::new(ArgCallback::new(a32_exclusive_write_32_trampoline as usize as u64, inner_ptr)),
+            exclusive_write_64: Box::new(ArgCallback::new(a32_exclusive_write_64_trampoline as usize as u64, inner_ptr)),
+            exclusive_write_128: Box::new(ArgCallback::new(a32_exclusive_write_128_trampoline as usize as u64, inner_ptr)),
+        };
+
+        let emit_config = EmitConfig {
+            callbacks: emit_callbacks,
+            enable_cycle_counting: config.enable_cycle_counting,
+        };
+
+        let mut emitter = A32EmitX64::new(
+            emit_config,
+            run_callbacks,
+            config.enable_optimizations,
+            cache_size,
+        )?;
+
+        let run_code_fn = unsafe { emitter.get_run_code_fn()? };
+
+        inner.emitter = Some(emitter);
+        inner.run_code_fn = Some(run_code_fn);
+
+        Ok(A32Jit { inner })
+    }
+
+    /// Execute JIT code until a halt reason is triggered.
+    pub fn run(&mut self) -> HaltReason {
+        assert!(!self.inner.is_executing, "Recursive JIT execution not allowed");
+        self.inner.is_executing = true;
+
+        let location = LocationDescriptor::new(self.inner.jit_state.get_unique_hash());
+        let inner_ptr = &mut *self.inner as *mut A32JitInner;
+
+        if let Some(ref mut emitter) = self.inner.emitter {
+            let _ = emitter.make_writable();
+        }
+
+        let read_code = move |vaddr: u32| -> Option<u32> {
+            let inner = unsafe { &*inner_ptr };
+            inner.callbacks.memory_read_code(vaddr as u64)
+        };
+
+        let code_ptr = self.inner.emitter.as_mut().unwrap()
+            .get_or_compile_block(location, &read_code);
+
+        let run_fn = {
+            let emitter = self.inner.emitter.as_mut().unwrap();
+            unsafe { emitter.get_run_code_fn().unwrap() }
+        };
+
+        let halt_bits = unsafe {
+            run_fn(&mut self.inner.jit_state as *mut _ as *mut A64JitState, code_ptr)
+        };
+
+        self.inner.is_executing = false;
+        HaltReason::from_bits_truncate(halt_bits)
+    }
+
+    /// Execute a single instruction.
+    pub fn step(&mut self) -> HaltReason {
+        assert!(!self.inner.is_executing, "Recursive JIT execution not allowed");
+        self.inner.is_executing = true;
+
+        let a32_loc = crate::ir::location::A32LocationDescriptor::from_location(
+            LocationDescriptor::new(self.inner.jit_state.get_unique_hash())
+        );
+        let location = a32_loc.set_single_stepping(true).to_location();
+
+        let inner_ptr = &mut *self.inner as *mut A32JitInner;
+
+        if let Some(ref mut emitter) = self.inner.emitter {
+            let _ = emitter.make_writable();
+        }
+
+        let read_code = move |vaddr: u32| -> Option<u32> {
+            let inner = unsafe { &*inner_ptr };
+            inner.callbacks.memory_read_code(vaddr as u64)
+        };
+
+        let code_ptr = self.inner.emitter.as_mut().unwrap()
+            .get_or_compile_block(location, &read_code);
+
+        let step_fn = {
+            let emitter = self.inner.emitter.as_mut().unwrap();
+            unsafe { emitter.get_step_code_fn().unwrap() }
+        };
+
+        let halt_bits = unsafe {
+            step_fn(&mut self.inner.jit_state as *mut _ as *mut A64JitState, code_ptr)
+        };
+
+        self.inner.is_executing = false;
+        HaltReason::from_bits_truncate(halt_bits)
+    }
+
+    /// Request halt from another thread.
+    pub fn halt_execution(&self, reason: HaltReason) {
+        let halt_ptr = &self.inner.jit_state.halt_reason as *const u32 as *const AtomicU32;
+        let atomic = unsafe { &*halt_ptr };
+        atomic.fetch_or(reason.bits(), Ordering::Release);
+    }
+
+    /// Clear specific halt reason bits.
+    pub fn clear_halt(&self, reason: HaltReason) {
+        let halt_ptr = &self.inner.jit_state.halt_reason as *const u32 as *const AtomicU32;
+        let atomic = unsafe { &*halt_ptr };
+        atomic.fetch_and(!reason.bits(), Ordering::Release);
+    }
+
+    // ---- Register accessors (R0-R15, u32) ----
+
+    pub fn get_register(&self, index: usize) -> u32 {
+        assert!(index < 16, "A32 register index out of range (0-15)");
+        self.inner.jit_state.reg[index]
+    }
+
+    pub fn set_register(&mut self, index: usize, value: u32) {
+        assert!(index < 16, "A32 register index out of range (0-15)");
+        self.inner.jit_state.reg[index] = value;
+    }
+
+    pub fn get_pc(&self) -> u32 {
+        self.inner.jit_state.reg[15]
+    }
+
+    pub fn set_pc(&mut self, value: u32) {
+        self.inner.jit_state.reg[15] = value;
+    }
+
+    pub fn get_cpsr(&self) -> u32 {
+        self.inner.jit_state.get_cpsr()
+    }
+
+    pub fn set_cpsr(&mut self, value: u32) {
+        self.inner.jit_state.set_cpsr(value);
+        // Update upper_location_descriptor from the CPSR state bits
+        let t = if value & (1 << 5) != 0 { 1u32 } else { 0 };
+        let e = if value & (1 << 9) != 0 { 1u32 << 1 } else { 0 };
+        // Extract IT state
+        let it_lo = (value >> 25) & 0x3;
+        let it_hi = (value >> 10) & 0x3F;
+        let it_state = (it_lo | (it_hi << 2)) as u32;
+        self.inner.jit_state.upper_location_descriptor =
+            (self.inner.jit_state.upper_location_descriptor & 0x07F7_0000) | t | e | (it_state << 8);
+    }
+
+    pub fn get_fpscr(&self) -> u32 {
+        self.inner.jit_state.get_fpscr()
+    }
+
+    pub fn set_fpscr(&mut self, value: u32) {
+        self.inner.jit_state.set_fpscr(value);
+        // Update FPSCR mode bits in upper_location_descriptor
+        let fpscr_mode = value & 0x07F7_0000;
+        self.inner.jit_state.upper_location_descriptor =
+            (self.inner.jit_state.upper_location_descriptor & !0x07F7_0000) | fpscr_mode;
+    }
+
+    /// Get extension register (S/D backing store, u32 element).
+    pub fn get_ext_reg(&self, index: usize) -> u32 {
+        assert!(index < 64, "A32 ext_reg index out of range (0-63)");
+        self.inner.jit_state.ext_reg[index]
+    }
+
+    /// Set extension register.
+    pub fn set_ext_reg(&mut self, index: usize, value: u32) {
+        assert!(index < 64, "A32 ext_reg index out of range (0-63)");
+        self.inner.jit_state.ext_reg[index] = value;
+    }
+
+    /// Invalidate cached blocks in a memory range.
+    pub fn invalidate_cache_range(&mut self, addr: u64, size: u64) {
+        if let Some(ref mut emitter) = self.inner.emitter {
+            emitter.invalidate_range(addr, size);
+        }
+    }
+
+    /// Clear all cached blocks.
+    pub fn clear_cache(&mut self) {
+        if let Some(ref mut emitter) = self.inner.emitter {
+            emitter.clear_cache();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A32 Callback trampolines
+// ---------------------------------------------------------------------------
+
+extern "C" fn a32_lookup_block_trampoline(inner_ptr: u64) -> u64 {
+    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
+    let location = LocationDescriptor::new(inner.jit_state.get_unique_hash());
+
+    let read_code = move |vaddr: u32| -> Option<u32> {
+        let inner = unsafe { &*(inner_ptr as *const A32JitInner) };
+        inner.callbacks.memory_read_code(vaddr as u64)
+    };
+
+    let emitter = inner.emitter.as_mut().unwrap();
+    let _ = emitter.make_writable();
+    let code_ptr = emitter.get_or_compile_block(location, &read_code);
+    let _ = unsafe { emitter.get_run_code_fn() };
+    code_ptr as u64
+}
+
+extern "C" fn a32_add_ticks_trampoline(inner_ptr: u64, ticks: u64) {
+    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
+    inner.callbacks.add_ticks(ticks);
+}
+
+extern "C" fn a32_get_ticks_remaining_trampoline(inner_ptr: u64) -> u64 {
+    let inner = unsafe { &*(inner_ptr as *const A32JitInner) };
+    inner.callbacks.get_ticks_remaining()
+}
+
+extern "C" fn a32_memory_read_8_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
+    let inner = unsafe { &*(inner_ptr as *const A32JitInner) };
+    inner.callbacks.memory_read_8(vaddr) as u64
+}
+extern "C" fn a32_memory_read_16_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
+    let inner = unsafe { &*(inner_ptr as *const A32JitInner) };
+    inner.callbacks.memory_read_16(vaddr) as u64
+}
+extern "C" fn a32_memory_read_32_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
+    let inner = unsafe { &*(inner_ptr as *const A32JitInner) };
+    inner.callbacks.memory_read_32(vaddr) as u64
+}
+extern "C" fn a32_memory_read_64_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
+    let inner = unsafe { &*(inner_ptr as *const A32JitInner) };
+    inner.callbacks.memory_read_64(vaddr)
+}
+extern "C" fn a32_memory_read_128_trampoline(inner_ptr: u64, vaddr: u64, ret_ptr: u64) {
+    let inner = unsafe { &*(inner_ptr as *const A32JitInner) };
+    let (lo, hi) = inner.callbacks.memory_read_128(vaddr);
+    unsafe { let ptr = ret_ptr as *mut u64; *ptr = lo; *ptr.add(1) = hi; }
+}
+
+extern "C" fn a32_memory_write_8_trampoline(inner_ptr: u64, vaddr: u64, value: u64) {
+    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
+    inner.callbacks.memory_write_8(vaddr, value as u8);
+}
+extern "C" fn a32_memory_write_16_trampoline(inner_ptr: u64, vaddr: u64, value: u64) {
+    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
+    inner.callbacks.memory_write_16(vaddr, value as u16);
+}
+extern "C" fn a32_memory_write_32_trampoline(inner_ptr: u64, vaddr: u64, value: u64) {
+    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
+    inner.callbacks.memory_write_32(vaddr, value as u32);
+}
+extern "C" fn a32_memory_write_64_trampoline(inner_ptr: u64, vaddr: u64, value: u64) {
+    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
+    inner.callbacks.memory_write_64(vaddr, value);
+}
+extern "C" fn a32_memory_write_128_trampoline(inner_ptr: u64, vaddr: u64, value_lo: u64, value_hi: u64) {
+    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
+    inner.callbacks.memory_write_128(vaddr, value_lo, value_hi);
+}
+
+extern "C" fn a32_call_supervisor_trampoline(inner_ptr: u64, svc_num: u64) {
+    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
+    inner.callbacks.call_supervisor(svc_num as u32);
+}
+extern "C" fn a32_exception_raised_trampoline(inner_ptr: u64, pc: u64, exception: u64) {
+    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
+    inner.callbacks.exception_raised(pc, exception);
+}
+extern "C" fn a32_data_cache_op_trampoline(inner_ptr: u64, op: u64, vaddr: u64) {
+    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
+    inner.callbacks.data_cache_operation(op, vaddr);
+}
+extern "C" fn a32_instruction_cache_op_trampoline(inner_ptr: u64, op: u64, vaddr: u64) {
+    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
+    inner.callbacks.instruction_cache_operation(op, vaddr);
+}
+
+extern "C" fn a32_exclusive_clear_trampoline(inner_ptr: u64) {
+    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
+    inner.callbacks.exclusive_clear();
+}
+extern "C" fn a32_exclusive_read_8_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
+    let inner = unsafe { &*(inner_ptr as *const A32JitInner) };
+    inner.callbacks.exclusive_read_8(vaddr) as u64
+}
+extern "C" fn a32_exclusive_read_16_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
+    let inner = unsafe { &*(inner_ptr as *const A32JitInner) };
+    inner.callbacks.exclusive_read_16(vaddr) as u64
+}
+extern "C" fn a32_exclusive_read_32_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
+    let inner = unsafe { &*(inner_ptr as *const A32JitInner) };
+    inner.callbacks.exclusive_read_32(vaddr) as u64
+}
+extern "C" fn a32_exclusive_read_64_trampoline(inner_ptr: u64, vaddr: u64) -> u64 {
+    let inner = unsafe { &*(inner_ptr as *const A32JitInner) };
+    inner.callbacks.exclusive_read_64(vaddr)
+}
+extern "C" fn a32_exclusive_read_128_trampoline(inner_ptr: u64, vaddr: u64, ret_ptr: u64) {
+    let inner = unsafe { &*(inner_ptr as *const A32JitInner) };
+    let (lo, hi) = inner.callbacks.exclusive_read_128(vaddr);
+    unsafe { let ptr = ret_ptr as *mut u64; *ptr = lo; *ptr.add(1) = hi; }
+}
+extern "C" fn a32_exclusive_write_8_trampoline(inner_ptr: u64, vaddr: u64, value: u64) -> u64 {
+    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
+    if inner.callbacks.exclusive_write_8(vaddr, value as u8) { 0 } else { 1 }
+}
+extern "C" fn a32_exclusive_write_16_trampoline(inner_ptr: u64, vaddr: u64, value: u64) -> u64 {
+    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
+    if inner.callbacks.exclusive_write_16(vaddr, value as u16) { 0 } else { 1 }
+}
+extern "C" fn a32_exclusive_write_32_trampoline(inner_ptr: u64, vaddr: u64, value: u64) -> u64 {
+    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
+    if inner.callbacks.exclusive_write_32(vaddr, value as u32) { 0 } else { 1 }
+}
+extern "C" fn a32_exclusive_write_64_trampoline(inner_ptr: u64, vaddr: u64, value: u64) -> u64 {
+    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
+    if inner.callbacks.exclusive_write_64(vaddr, value) { 0 } else { 1 }
+}
+extern "C" fn a32_exclusive_write_128_trampoline(inner_ptr: u64, vaddr: u64, value_lo: u64, value_hi: u64) -> u64 {
+    let inner = unsafe { &mut *(inner_ptr as *mut A32JitInner) };
     if inner.callbacks.exclusive_write_128(vaddr, value_lo, value_hi) { 0 } else { 1 }
 }
 

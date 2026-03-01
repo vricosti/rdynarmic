@@ -9,6 +9,8 @@ pub mod callback;
 pub mod reg_alloc;
 pub mod emit_context;
 pub mod emit_a64;
+pub mod a32_emit_a32;
+pub mod a32_emit_x64;
 pub mod emit_data_processing;
 pub mod emit_memory;
 pub mod emit_exclusive_memory;

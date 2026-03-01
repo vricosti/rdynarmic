@@ -17,6 +17,12 @@ pub const X64_Z_FLAG_BIT: u32 = 14; // ZF
 pub const X64_C_FLAG_BIT: u32 = 8;  // CF
 pub const X64_V_FLAG_BIT: u32 = 0;  // OF
 
+/// x86-64 individual flag masks
+pub const X64_N_FLAG_MASK: u32 = 1 << X64_N_FLAG_BIT;
+pub const X64_Z_FLAG_MASK: u32 = 1 << X64_Z_FLAG_BIT;
+pub const X64_C_FLAG_MASK: u32 = 1 << X64_C_FLAG_BIT;
+pub const X64_V_FLAG_MASK: u32 = 1 << X64_V_FLAG_BIT;
+
 /// Magic multiplier: ARM NZCV (bits 3:0 after shift) → x64 flag positions
 pub const TO_X64_MULTIPLIER: u32 = 0x1081;
 

@@ -292,6 +292,283 @@ impl A64JitState {
     }
 }
 
+// ===========================================================================
+// A32 JIT State
+// ===========================================================================
+
+/// MXCSR rounding mode values for A32 (same as A64).
+const A32_MXCSR_RMODE: [u32; 4] = [0x0000, 0x4000, 0x2000, 0x6000];
+
+/// FPSCR bit positions.
+const FPSCR_RMODE_SHIFT: u32 = 22;
+const FPSCR_FZ_BIT: u32 = 24;
+const FPSCR_QC_BIT: u32 = 27;
+const FPSCR_NZCV_MASK: u32 = 0xF000_0000;
+
+/// ARM32 JIT state — the in-memory representation used during JIT execution.
+///
+/// R15 points to this struct during guest code execution.
+/// Fields are laid out for efficient access from generated x86-64 code.
+///
+/// Matches the C++ `A32JitState` struct layout from dynarmic.
+///
+/// Key differences from A64JitState:
+/// - 16 × u32 GPRs (not 31 × u64) — R0-R15 where R15=PC, R13=SP, R14=LR
+/// - CPSR split across multiple fields (NZCV, Q, GE, JAIFM)
+/// - ext_reg array (S0-S31 / D0-D31 aliased storage)
+/// - upper_location_descriptor encodes T/E/IT/FPSCR mode bits
+#[repr(C, align(16))]
+pub struct A32JitState {
+    /// General-purpose registers R0-R15.
+    /// R13=SP, R14=LR, R15=PC.
+    pub reg: [u32; 16],
+
+    /// Extension registers — S0-S31 aliased with D0-D31.
+    /// S registers use 1 u32 each (indices 0..31).
+    /// D registers use 2 u32 each (even indices 0,2,4,...62).
+    /// 16-byte aligned for SSE access to Q (quad) registers.
+    pub ext_reg: [u32; 64],
+
+    /// CPSR NZCV flags stored in x86-64 RFLAGS format for efficient flag ops.
+    pub cpsr_nzcv: u32,
+    /// CPSR Q (saturation) flag.
+    pub cpsr_q: u32,
+    /// CPSR GE[3:0] flags (stored in low 4 bits).
+    pub cpsr_ge: [u32; 4],
+    /// CPSR J, A, I, F, M bits (packed).
+    pub cpsr_jaifm: u32,
+
+    /// Upper location descriptor: T flag, E flag, IT state, FPSCR mode bits.
+    /// Used to reconstruct the A32LocationDescriptor for block lookup.
+    pub upper_location_descriptor: u32,
+
+    /// FPSCR NZCV flags (stored in x86-64 RFLAGS format).
+    pub fpsr_nzcv: u32,
+    /// FPSCR exception accumulator (sticky bits from MXCSR).
+    pub fpsr_exc: u32,
+    /// FPSCR QC (saturation) flag.
+    pub fpsr_qc: u32,
+
+    /// Guest MXCSR (x86-64 SSE control/status for guest FP rounding/exceptions).
+    pub guest_mxcsr: u32,
+    /// ASIMD MXCSR (separate control for standard ASIMD operations).
+    pub asimd_mxcsr: u32,
+
+    /// Halt reason flags (checked atomically by dispatcher loop).
+    pub halt_reason: u32,
+
+    /// Exclusive state flag (0 = no reservation, 1 = active reservation).
+    pub exclusive_state: u8,
+    _pad_exclusive: [u8; 3],
+
+    /// Current RSB pointer index.
+    pub rsb_ptr: u32,
+    /// RSB location descriptors (hashed PC+state for lookup).
+    pub rsb_location_descriptors: [u64; RSB_SIZE],
+    /// RSB code pointers (native x86-64 addresses).
+    pub rsb_codeptrs: [u64; RSB_SIZE],
+}
+
+impl A32JitState {
+    /// Create a new zeroed JIT state with default MXCSR values.
+    pub fn new() -> Self {
+        let mut state = Self {
+            reg: [0; 16],
+            ext_reg: [0; 64],
+            cpsr_nzcv: 0,
+            cpsr_q: 0,
+            cpsr_ge: [0; 4],
+            cpsr_jaifm: 0,
+            upper_location_descriptor: 0,
+            fpsr_nzcv: 0,
+            fpsr_exc: 0,
+            fpsr_qc: 0,
+            guest_mxcsr: 0x0000_1F80, // all exceptions masked
+            asimd_mxcsr: 0x0000_9FC0, // flush-to-zero + denormals-are-zero + all masked
+            halt_reason: 0,
+            exclusive_state: 0,
+            _pad_exclusive: [0; 3],
+            rsb_ptr: 0,
+            rsb_location_descriptors: [0; RSB_SIZE],
+            rsb_codeptrs: [0; RSB_SIZE],
+        };
+        state.reset_rsb();
+        state
+    }
+
+    /// Reset the return stack buffer to invalid entries.
+    pub fn reset_rsb(&mut self) {
+        self.rsb_location_descriptors.fill(0xFFFF_FFFF_FFFF_FFFF);
+        self.rsb_codeptrs.fill(0);
+    }
+
+    /// Reconstruct the full CPSR from split fields.
+    pub fn get_cpsr(&self) -> u32 {
+        let nzcv = nzcv_util::from_x64(self.cpsr_nzcv);
+        let q = if self.cpsr_q != 0 { 1u32 << 27 } else { 0 };
+        let ge = ((self.cpsr_ge[3] & 1) << 19)
+               | ((self.cpsr_ge[2] & 1) << 18)
+               | ((self.cpsr_ge[1] & 1) << 17)
+               | ((self.cpsr_ge[0] & 1) << 16);
+        nzcv | q | ge | self.cpsr_jaifm
+    }
+
+    /// Decompose and set CPSR from a full 32-bit value.
+    pub fn set_cpsr(&mut self, cpsr: u32) {
+        self.cpsr_nzcv = nzcv_util::to_x64(cpsr);
+        self.cpsr_q = if cpsr & (1 << 27) != 0 { 1 } else { 0 };
+        self.cpsr_ge[0] = (cpsr >> 16) & 1;
+        self.cpsr_ge[1] = (cpsr >> 17) & 1;
+        self.cpsr_ge[2] = (cpsr >> 18) & 1;
+        self.cpsr_ge[3] = (cpsr >> 19) & 1;
+        // J, A, I, F, T, M bits and IT state
+        self.cpsr_jaifm = cpsr & 0x010F_F3DF;
+    }
+
+    /// Get the full FPSCR value by combining MXCSR exception bits with stored state.
+    pub fn get_fpscr(&self) -> u32 {
+        let nzcv = nzcv_util::from_x64(self.fpsr_nzcv);
+        let qc = if self.fpsr_qc != 0 { 1u32 << FPSCR_QC_BIT } else { 0 };
+
+        let mxcsr = self.guest_mxcsr | self.asimd_mxcsr;
+        let mut exc = 0u32;
+        // IOC = IE (bit 0)
+        exc |= mxcsr & 0b0000_0000_0001;
+        // IXC, UFC, OFC, DZC = PE, UE, OE, ZE (shifted down by 1)
+        exc |= (mxcsr & 0b0000_0011_1100) >> 1;
+        exc |= self.fpsr_exc;
+
+        // Reconstruct the control bits from the upper_location_descriptor
+        // which stores the FPSCR mode bits.
+        let fpscr_mode = self.upper_location_descriptor & 0x07F7_0000;
+
+        nzcv | qc | fpscr_mode | exc
+    }
+
+    /// Set FPSCR value and update MXCSR shadow registers accordingly.
+    pub fn set_fpscr(&mut self, value: u32) {
+        self.fpsr_nzcv = nzcv_util::to_x64(value);
+        self.fpsr_qc = if value & (1 << FPSCR_QC_BIT) != 0 { 1 } else { 0 };
+        self.fpsr_exc = value & 0x9F;
+
+        // Clear exception flags, preserve control
+        self.asimd_mxcsr &= MXCSR_EXCEPTION_FLAGS;
+        self.guest_mxcsr &= MXCSR_EXCEPTION_FLAGS;
+        // Mask all exceptions
+        self.asimd_mxcsr |= MXCSR_EXCEPTION_MASK;
+        self.guest_mxcsr |= MXCSR_EXCEPTION_MASK;
+
+        // Map ARM RMode to MXCSR rounding mode
+        let rmode = ((value >> FPSCR_RMODE_SHIFT) & 0x3) as usize;
+        self.guest_mxcsr |= A32_MXCSR_RMODE[rmode];
+
+        // Map ARM FZ to MXCSR FZ + DAZ
+        if value & (1 << FPSCR_FZ_BIT) != 0 {
+            self.guest_mxcsr |= MXCSR_FLUSH_TO_ZERO;
+            self.guest_mxcsr |= MXCSR_DENORMALS_ARE_ZERO;
+        }
+    }
+
+    /// Compute unique hash for block lookup (PC in lower 32 bits, upper_location_descriptor in upper 32).
+    pub fn get_unique_hash(&self) -> u64 {
+        let lower = self.reg[15] as u64;
+        let upper = (self.upper_location_descriptor as u64) << 32;
+        lower | upper
+    }
+}
+
+impl Default for A32JitState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Field offsets for use by code emitters (accessed via R15 + offset).
+impl A32JitState {
+    pub const fn offset_of_reg() -> usize {
+        0
+    }
+
+    pub const fn offset_of_ext_reg() -> usize {
+        core::mem::offset_of!(A32JitState, ext_reg)
+    }
+
+    pub const fn offset_of_cpsr_nzcv() -> usize {
+        core::mem::offset_of!(A32JitState, cpsr_nzcv)
+    }
+
+    pub const fn offset_of_cpsr_q() -> usize {
+        core::mem::offset_of!(A32JitState, cpsr_q)
+    }
+
+    pub const fn offset_of_cpsr_ge() -> usize {
+        core::mem::offset_of!(A32JitState, cpsr_ge)
+    }
+
+    pub const fn offset_of_cpsr_jaifm() -> usize {
+        core::mem::offset_of!(A32JitState, cpsr_jaifm)
+    }
+
+    pub const fn offset_of_upper_location_descriptor() -> usize {
+        core::mem::offset_of!(A32JitState, upper_location_descriptor)
+    }
+
+    pub const fn offset_of_fpsr_nzcv() -> usize {
+        core::mem::offset_of!(A32JitState, fpsr_nzcv)
+    }
+
+    pub const fn offset_of_fpsr_exc() -> usize {
+        core::mem::offset_of!(A32JitState, fpsr_exc)
+    }
+
+    pub const fn offset_of_fpsr_qc() -> usize {
+        core::mem::offset_of!(A32JitState, fpsr_qc)
+    }
+
+    pub const fn offset_of_guest_mxcsr() -> usize {
+        core::mem::offset_of!(A32JitState, guest_mxcsr)
+    }
+
+    pub const fn offset_of_asimd_mxcsr() -> usize {
+        core::mem::offset_of!(A32JitState, asimd_mxcsr)
+    }
+
+    pub const fn offset_of_halt_reason() -> usize {
+        core::mem::offset_of!(A32JitState, halt_reason)
+    }
+
+    pub const fn offset_of_exclusive_state() -> usize {
+        core::mem::offset_of!(A32JitState, exclusive_state)
+    }
+
+    pub const fn offset_of_rsb_ptr() -> usize {
+        core::mem::offset_of!(A32JitState, rsb_ptr)
+    }
+
+    pub const fn offset_of_rsb_location_descriptors() -> usize {
+        core::mem::offset_of!(A32JitState, rsb_location_descriptors)
+    }
+
+    pub const fn offset_of_rsb_codeptrs() -> usize {
+        core::mem::offset_of!(A32JitState, rsb_codeptrs)
+    }
+
+    /// Byte offset of register `reg_index` (0-15) from the base.
+    pub const fn reg_offset(reg_index: usize) -> usize {
+        Self::offset_of_reg() + reg_index * 4
+    }
+
+    /// Byte offset of extension register element (4 bytes each).
+    pub const fn ext_reg_offset(ext_index: usize) -> usize {
+        Self::offset_of_ext_reg() + ext_index * 4
+    }
+
+    /// Byte offset of GE flag element (4 bytes each, 0-3).
+    pub const fn cpsr_ge_offset(ge_index: usize) -> usize {
+        Self::offset_of_cpsr_ge() + ge_index * 4
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,5 +662,81 @@ mod tests {
         state.fpcr = 0x00C0_0000; // RMode = 3
         let hash2 = state.get_unique_hash();
         assert_ne!(hash1, hash2, "Different FPCR should produce different hash");
+    }
+
+    // --- A32 JIT State Tests ---
+
+    #[test]
+    fn test_a32_jit_state_alignment() {
+        assert_eq!(core::mem::align_of::<A32JitState>(), 16);
+    }
+
+    #[test]
+    fn test_a32_default_mxcsr() {
+        let state = A32JitState::new();
+        assert_eq!(state.guest_mxcsr, 0x0000_1F80);
+        assert_eq!(state.asimd_mxcsr, 0x0000_9FC0);
+    }
+
+    #[test]
+    fn test_a32_cpsr_round_trip() {
+        let mut state = A32JitState::new();
+        // Test NZCV bits
+        for nzcv_bits in 0u32..16 {
+            let cpsr = nzcv_bits << 28;
+            state.set_cpsr(cpsr);
+            assert_eq!(state.get_cpsr() & 0xF000_0000, cpsr,
+                "NZCV round-trip failed for {:#x}", cpsr);
+        }
+        // Test Q flag
+        state.set_cpsr(1 << 27);
+        assert_eq!(state.cpsr_q, 1);
+        assert_ne!(state.get_cpsr() & (1 << 27), 0);
+
+        // Test GE flags
+        state.set_cpsr(0x000F_0000);
+        assert_eq!(state.cpsr_ge[0], 1);
+        assert_eq!(state.cpsr_ge[1], 1);
+        assert_eq!(state.cpsr_ge[2], 1);
+        assert_eq!(state.cpsr_ge[3], 1);
+        assert_eq!(state.get_cpsr() & 0x000F_0000, 0x000F_0000);
+    }
+
+    #[test]
+    fn test_a32_rsb_reset() {
+        let state = A32JitState::new();
+        for &loc in &state.rsb_location_descriptors {
+            assert_eq!(loc, 0xFFFF_FFFF_FFFF_FFFF);
+        }
+        for &ptr in &state.rsb_codeptrs {
+            assert_eq!(ptr, 0);
+        }
+    }
+
+    #[test]
+    fn test_a32_reg_offsets_sequential() {
+        let off0 = A32JitState::reg_offset(0);
+        let off1 = A32JitState::reg_offset(1);
+        assert_eq!(off1 - off0, 4); // u32 registers
+    }
+
+    #[test]
+    fn test_a32_unique_hash() {
+        let mut state = A32JitState::new();
+        state.reg[15] = 0x0800_1000;
+        state.upper_location_descriptor = 0;
+        let hash1 = state.get_unique_hash();
+        assert_eq!(hash1, 0x0800_1000);
+
+        state.upper_location_descriptor = 1; // T flag
+        let hash2 = state.get_unique_hash();
+        assert_ne!(hash1, hash2, "Different upper descriptor should produce different hash");
+    }
+
+    #[test]
+    fn test_a32_ext_reg_offset() {
+        let off0 = A32JitState::ext_reg_offset(0);
+        let off1 = A32JitState::ext_reg_offset(1);
+        assert_eq!(off1 - off0, 4); // u32 elements
     }
 }
