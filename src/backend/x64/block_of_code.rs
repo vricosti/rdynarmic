@@ -9,6 +9,26 @@ use crate::backend::x64::constant_pool::ConstantPool;
 use crate::backend::x64::jit_state::A64JitState;
 use crate::backend::x64::stack_layout::StackLayout;
 
+/// Field offsets into the JitState struct (A32 or A64).
+/// Passed at construction time to make BlockOfCode architecture-agnostic.
+#[derive(Clone, Copy, Debug)]
+pub struct JitStateOffsets {
+    pub halt_reason: usize,
+    pub guest_mxcsr: usize,
+    pub asimd_mxcsr: usize,
+}
+
+impl JitStateOffsets {
+    /// Default offsets for A64JitState (backward compatibility).
+    pub fn a64_defaults() -> Self {
+        Self {
+            halt_reason: A64JitState::offset_of_halt_reason(),
+            guest_mxcsr: A64JitState::offset_of_guest_mxcsr(),
+            asimd_mxcsr: A64JitState::offset_of_asimd_mxcsr(),
+        }
+    }
+}
+
 /// Default code cache size (128 MB).
 pub const DEFAULT_CODE_SIZE: usize = 128 * 1024 * 1024;
 
@@ -70,22 +90,30 @@ pub struct BlockOfCode {
     prelude_complete: bool,
     /// Code pointer where user-emitted blocks begin (after prelude).
     pub(crate) code_begin_offset: usize,
+    /// JitState field offsets (architecture-specific: A32 vs A64).
+    pub jit_state_offsets: JitStateOffsets,
 }
 
 impl BlockOfCode {
-    /// Create a new BlockOfCode with the default code cache size.
+    /// Create a new BlockOfCode with the default code cache size (A64 offsets).
     pub fn new() -> rxbyak::Result<Self> {
         Self::with_size(DEFAULT_CODE_SIZE)
     }
 
-    /// Create a new BlockOfCode with a custom code cache size.
+    /// Create a new BlockOfCode with a custom code cache size (A64 offsets).
     pub fn with_size(total_size: usize) -> rxbyak::Result<Self> {
+        Self::with_size_and_offsets(total_size, JitStateOffsets::a64_defaults())
+    }
+
+    /// Create a new BlockOfCode with a custom code cache size and architecture-specific offsets.
+    pub fn with_size_and_offsets(total_size: usize, offsets: JitStateOffsets) -> rxbyak::Result<Self> {
         let asm = CodeAssembler::new(total_size)?;
         Ok(Self {
             asm,
             constant_pool: ConstantPool::new(CONSTANT_POOL_SIZE),
             prelude_complete: false,
             code_begin_offset: 0,
+            jit_state_offsets: offsets,
         })
     }
 
@@ -169,7 +197,7 @@ impl BlockOfCode {
     /// Saves host MXCSR to StackLayout, loads guest MXCSR from JitState.
     pub fn emit_switch_mxcsr_on_entry(&mut self) -> rxbyak::Result<()> {
         let host_mxcsr_offset = StackLayout::save_host_mxcsr_offset();
-        let guest_mxcsr_offset = A64JitState::offset_of_guest_mxcsr();
+        let guest_mxcsr_offset = self.jit_state_offsets.guest_mxcsr;
 
         // stmxcsr [rsp + host_mxcsr_offset]
         self.asm.stmxcsr(dword_ptr(RegExp::from(RSP) + host_mxcsr_offset as i32))?;
@@ -183,7 +211,7 @@ impl BlockOfCode {
     /// Saves guest MXCSR to JitState, loads host MXCSR from StackLayout.
     pub fn emit_switch_mxcsr_on_exit(&mut self) -> rxbyak::Result<()> {
         let host_mxcsr_offset = StackLayout::save_host_mxcsr_offset();
-        let guest_mxcsr_offset = A64JitState::offset_of_guest_mxcsr();
+        let guest_mxcsr_offset = self.jit_state_offsets.guest_mxcsr;
 
         // stmxcsr [r15 + guest_mxcsr_offset]
         self.asm.stmxcsr(dword_ptr(RegExp::from(R15) + guest_mxcsr_offset as i32))?;
@@ -196,8 +224,8 @@ impl BlockOfCode {
     ///
     /// Saves guest MXCSR, loads ASIMD MXCSR.
     pub fn emit_enter_standard_asimd(&mut self) -> rxbyak::Result<()> {
-        let guest_offset = A64JitState::offset_of_guest_mxcsr();
-        let asimd_offset = A64JitState::offset_of_asimd_mxcsr();
+        let guest_offset = self.jit_state_offsets.guest_mxcsr;
+        let asimd_offset = self.jit_state_offsets.asimd_mxcsr;
 
         self.asm.stmxcsr(dword_ptr(RegExp::from(R15) + guest_offset as i32))?;
         self.asm.ldmxcsr(dword_ptr(RegExp::from(R15) + asimd_offset as i32))?;
@@ -208,8 +236,8 @@ impl BlockOfCode {
     ///
     /// Saves ASIMD MXCSR, loads guest MXCSR.
     pub fn emit_leave_standard_asimd(&mut self) -> rxbyak::Result<()> {
-        let guest_offset = A64JitState::offset_of_guest_mxcsr();
-        let asimd_offset = A64JitState::offset_of_asimd_mxcsr();
+        let guest_offset = self.jit_state_offsets.guest_mxcsr;
+        let asimd_offset = self.jit_state_offsets.asimd_mxcsr;
 
         self.asm.stmxcsr(dword_ptr(RegExp::from(R15) + asimd_offset as i32))?;
         self.asm.ldmxcsr(dword_ptr(RegExp::from(R15) + guest_offset as i32))?;
@@ -288,7 +316,7 @@ impl BlockOfCode {
         assert!(!self.prelude_complete, "gen_run_code must be called before prelude_complete");
 
         let frame_size = core::mem::size_of::<StackLayout>();
-        let halt_offset = A64JitState::offset_of_halt_reason();
+        let halt_offset = self.jit_state_offsets.halt_reason;
         let cycles_remaining_off = StackLayout::cycles_remaining_offset();
         let cycles_to_run_off = StackLayout::cycles_to_run_offset();
 

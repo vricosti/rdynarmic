@@ -8,7 +8,7 @@ use rxbyak::{RAX, RBX, RBP, R12, R15, RegExp, JmpType};
 use rxbyak::{dword_ptr, qword_ptr};
 
 use crate::backend::x64::block_cache::{BlockCache, CachedBlock};
-use crate::backend::x64::block_of_code::{BlockOfCode, DispatcherLabels, RunCodeCallbacks, RunCodeFn};
+use crate::backend::x64::block_of_code::{BlockOfCode, DispatcherLabels, JitStateOffsets, RunCodeCallbacks, RunCodeFn};
 use crate::backend::x64::emit::emit_block;
 use crate::backend::x64::emit_context::{EmitConfig, EmitContext};
 use crate::backend::x64::jit_state::{A32JitState, RSB_PTR_MASK};
@@ -58,8 +58,11 @@ impl A32EmitX64 {
         enable_optimizations: bool,
         cache_size: usize,
     ) -> Result<Self, String> {
-        let mut code = BlockOfCode::with_size(cache_size)
-            .map_err(|e| format!("Failed to allocate code buffer: {:?}", e))?;
+        let mut code = BlockOfCode::with_size_and_offsets(cache_size, JitStateOffsets {
+            halt_reason: A32JitState::offset_of_halt_reason(),
+            guest_mxcsr: A32JitState::offset_of_guest_mxcsr(),
+            asimd_mxcsr: A32JitState::offset_of_asimd_mxcsr(),
+        }).map_err(|e| format!("Failed to allocate code buffer: {:?}", e))?;
 
         let dispatcher_labels = code.gen_run_code(&run_callbacks)
             .map_err(|e| format!("Failed to generate dispatcher: {:?}", e))?;
