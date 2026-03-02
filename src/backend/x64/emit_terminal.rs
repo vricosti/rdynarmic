@@ -5,12 +5,10 @@ use rxbyak::{byte_ptr, dword_ptr, qword_ptr};
 use crate::backend::x64::block_of_code::FORCE_RETURN;
 use crate::backend::x64::emit_context::EmitContext;
 use crate::backend::x64::emit_data_processing::load_nzcv_into_flags;
-use crate::backend::x64::jit_state::A64JitState;
 use crate::backend::x64::patch_info::{PatchEntry, PatchType, PATCH_JG_SIZE, PATCH_JZ_SIZE, PATCH_JMP_SIZE};
 use crate::backend::x64::reg_alloc::RegAlloc;
 use crate::backend::x64::stack_layout::StackLayout;
 use crate::ir::cond::Cond;
-use crate::ir::location::A64LocationDescriptor;
 use crate::ir::terminal::Terminal;
 
 // ---------------------------------------------------------------------------
@@ -69,6 +67,38 @@ pub fn emit_terminal(ctx: &EmitContext, ra: &mut RegAlloc, terminal: &Terminal) 
 }
 
 // ---------------------------------------------------------------------------
+// Architecture-aware helpers
+// ---------------------------------------------------------------------------
+
+/// Emit: store the target PC into JitState and (for A32) update
+/// upper_location_descriptor if it differs from the current block's.
+fn emit_set_pc(ctx: &EmitContext, ra: &mut RegAlloc, next: crate::ir::location::LocationDescriptor) {
+    let pc = ctx.arch.extract_pc(next);
+    let pc_offset = ctx.arch.pc_offset();
+
+    if ctx.arch.pc_width() == 4 {
+        // A32: 32-bit PC stored in reg[15]
+        ra.asm.mov(dword_ptr(RegExp::from(R15) + pc_offset as i32), pc as i32).unwrap();
+    } else {
+        // A64: 64-bit PC stored in JitState.pc
+        ra.asm.mov(RAX, pc as i64).unwrap();
+        ra.asm.mov(qword_ptr(RegExp::from(R15) + pc_offset as i32), RAX).unwrap();
+    }
+
+    // A32: update upper_location_descriptor if changed
+    if let Some(upper_offset) = ctx.arch.upper_location_descriptor_offset() {
+        let new_upper = ctx.arch.extract_upper_location_descriptor(next);
+        let old_upper = ctx.arch.extract_upper_location_descriptor(ctx.location);
+        // Strip single_stepping bit for comparison (matching dynarmic)
+        let new_masked = new_upper & !4;
+        let old_masked = old_upper & !4;
+        if new_masked != old_masked {
+            ra.asm.mov(dword_ptr(RegExp::from(R15) + upper_offset as i32), new_masked as i32).unwrap();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ReturnToDispatch: return control to the host dispatcher
 // ---------------------------------------------------------------------------
 
@@ -94,13 +124,8 @@ fn emit_terminal_return_to_dispatch(ctx: &EmitContext, ra: &mut RegAlloc) {
 
 /// Emit: set PC to next, check cycles/halt inline, jump to dispatcher or direct link.
 fn emit_terminal_link_block(ctx: &EmitContext, ra: &mut RegAlloc, next: crate::ir::location::LocationDescriptor) {
-    let a64_next = A64LocationDescriptor::from_location(next);
-    let pc = a64_next.pc();
-    let pc_offset = A64JitState::offset_of_pc();
-
-    // Store target PC in jit_state
-    ra.asm.mov(RAX, pc as i64).unwrap();
-    ra.asm.mov(qword_ptr(RegExp::from(R15) + pc_offset as i32), RAX).unwrap();
+    // Store target PC (and A32 upper_location_descriptor if needed)
+    emit_set_pc(ctx, ra, next);
 
     if let Some(offsets) = ctx.dispatcher_offsets {
         let use_linking = ctx.enable_block_linking && !ctx.is_single_step;
@@ -137,7 +162,7 @@ fn emit_terminal_link_block(ctx: &EmitContext, ra: &mut RegAlloc, next: crate::i
             emit_jmp_to_offset(ra.asm, offsets[FORCE_RETURN], ctx.code_base_ptr);
         } else {
             // No cycle counting: check halt_reason
-            let halt_offset = A64JitState::offset_of_halt_reason();
+            let halt_offset = ctx.arch.halt_reason_offset();
             ra.asm.cmp(dword_ptr(RegExp::from(R15) + halt_offset as i32), 0i32).unwrap();
 
             if use_linking {
@@ -181,7 +206,7 @@ fn emit_terminal_link_block(ctx: &EmitContext, ra: &mut RegAlloc, next: crate::i
             emit_add_ticks(ctx, ra);
             ra.asm.ret().unwrap();
         } else {
-            let halt_offset = A64JitState::offset_of_halt_reason();
+            let halt_offset = ctx.arch.halt_reason_offset();
             let halt_label = ra.asm.create_label();
             ra.asm.cmp(dword_ptr(RegExp::from(R15) + halt_offset as i32), 0i32).unwrap();
             ra.asm.jnz(&halt_label, JmpType::Near).unwrap();
@@ -200,13 +225,8 @@ fn emit_terminal_link_block(ctx: &EmitContext, ra: &mut RegAlloc, next: crate::i
 
 /// Emit: set PC to next, return to dispatch or direct link (unconditional).
 fn emit_terminal_link_block_fast(ctx: &EmitContext, ra: &mut RegAlloc, next: crate::ir::location::LocationDescriptor) {
-    let a64_next = A64LocationDescriptor::from_location(next);
-    let pc = a64_next.pc();
-    let pc_offset = A64JitState::offset_of_pc();
-
-    // Store target PC
-    ra.asm.mov(RAX, pc as i64).unwrap();
-    ra.asm.mov(qword_ptr(RegExp::from(R15) + pc_offset as i32), RAX).unwrap();
+    // Store target PC (and A32 upper_location_descriptor if needed)
+    emit_set_pc(ctx, ra, next);
 
     if let Some(offsets) = ctx.dispatcher_offsets {
         let use_linking = ctx.enable_block_linking && !ctx.is_single_step;
@@ -242,13 +262,8 @@ fn emit_terminal_link_block_fast(ctx: &EmitContext, ra: &mut RegAlloc, next: cra
 
 /// Emit: set PC, return to dispatcher with FORCE_RETURN.
 fn emit_terminal_interpret(ctx: &EmitContext, ra: &mut RegAlloc, next: crate::ir::location::LocationDescriptor, _num_instructions: usize) {
-    let a64_next = A64LocationDescriptor::from_location(next);
-    let pc = a64_next.pc();
-    let pc_offset = A64JitState::offset_of_pc();
-
-    // Store target PC
-    ra.asm.mov(RAX, pc as i64).unwrap();
-    ra.asm.mov(qword_ptr(RegExp::from(R15) + pc_offset as i32), RAX).unwrap();
+    // Store target PC (and A32 upper_location_descriptor if needed)
+    emit_set_pc(ctx, ra, next);
 
     if let Some(offsets) = ctx.dispatcher_offsets {
         emit_jmp_to_offset(ra.asm, offsets[FORCE_RETURN], ctx.code_base_ptr);
@@ -309,7 +324,7 @@ fn emit_terminal_check_bit(ctx: &EmitContext, ra: &mut RegAlloc, then_: &Termina
 
 /// Emit: if halt_reason != 0, force return to host; otherwise emit else_.
 fn emit_terminal_check_halt(ctx: &EmitContext, ra: &mut RegAlloc, else_: &Terminal) {
-    let halt_offset = A64JitState::offset_of_halt_reason();
+    let halt_offset = ctx.arch.halt_reason_offset();
     let halt_label = ra.asm.create_label();
 
     ra.asm.cmp(dword_ptr(RegExp::from(R15) + halt_offset as i32), 0i32).unwrap();

@@ -1,8 +1,87 @@
 use std::cell::RefCell;
 
 use crate::backend::x64::callback::Callback;
+use crate::backend::x64::jit_state::{A32JitState, A64JitState};
 use crate::backend::x64::patch_info::PatchEntry;
-use crate::ir::location::LocationDescriptor;
+use crate::ir::location::{A32LocationDescriptor, A64LocationDescriptor, LocationDescriptor};
+
+/// Architecture-specific configuration for terminal emission.
+///
+/// Provides the correct JitState field offsets and location descriptor
+/// interpretation for A32 vs A64 blocks. This avoids hardcoding A64 offsets
+/// in the shared `emit_terminal.rs` code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArchConfig {
+    A64,
+    A32,
+}
+
+impl ArchConfig {
+    /// Offset of the PC field in the JitState struct.
+    /// A64: `A64JitState::pc` (qword at ~offset 256).
+    /// A32: `A32JitState::reg[15]` (dword at offset 60).
+    pub fn pc_offset(self) -> usize {
+        match self {
+            Self::A64 => A64JitState::offset_of_pc(),
+            Self::A32 => A32JitState::reg_offset(15),
+        }
+    }
+
+    /// Width of the PC value in bytes (8 for A64, 4 for A32).
+    pub fn pc_width(self) -> usize {
+        match self {
+            Self::A64 => 8,
+            Self::A32 => 4,
+        }
+    }
+
+    /// Offset of `halt_reason` in the JitState struct.
+    pub fn halt_reason_offset(self) -> usize {
+        match self {
+            Self::A64 => A64JitState::offset_of_halt_reason(),
+            Self::A32 => A32JitState::offset_of_halt_reason(),
+        }
+    }
+
+    /// Extract the PC value from a generic LocationDescriptor.
+    /// A64: sign-extended 56-bit PC from A64LocationDescriptor.
+    /// A32: lower 32 bits from A32LocationDescriptor.
+    pub fn extract_pc(self, loc: LocationDescriptor) -> u64 {
+        match self {
+            Self::A64 => A64LocationDescriptor::from_location(loc).pc(),
+            Self::A32 => A32LocationDescriptor::from_location(loc).pc() as u64,
+        }
+    }
+
+    /// Extract the single_stepping flag from a LocationDescriptor.
+    pub fn extract_single_stepping(self, loc: LocationDescriptor) -> bool {
+        match self {
+            Self::A64 => A64LocationDescriptor::from_location(loc).single_stepping(),
+            Self::A32 => A32LocationDescriptor::from_location(loc).single_stepping(),
+        }
+    }
+
+    /// Offset of `upper_location_descriptor` in A32JitState (None for A64).
+    pub fn upper_location_descriptor_offset(self) -> Option<usize> {
+        match self {
+            Self::A64 => None,
+            Self::A32 => Some(A32JitState::offset_of_upper_location_descriptor()),
+        }
+    }
+
+    /// Compute the upper_location_descriptor value for an A32 location.
+    /// Returns 0 for A64 (no upper descriptor).
+    pub fn extract_upper_location_descriptor(self, loc: LocationDescriptor) -> u32 {
+        match self {
+            Self::A64 => 0,
+            Self::A32 => A32LocationDescriptor::from_location(loc).upper_location_descriptor(),
+        }
+    }
+
+    pub fn is_a32(self) -> bool {
+        matches!(self, Self::A32)
+    }
+}
 
 /// Descriptor for a compiled block of native code.
 pub struct BlockDescriptor {
@@ -81,6 +160,9 @@ pub struct EmitContext<'a> {
     pub location: LocationDescriptor,
     /// Emitter configuration and callbacks.
     pub config: &'a EmitConfig,
+    /// Architecture-specific configuration (A32 vs A64).
+    /// Controls PC offset, halt_reason offset, location descriptor parsing.
+    pub arch: ArchConfig,
     /// Dispatcher return_from_run_code offsets (4 entries).
     ///
     /// When `Some`, terminals emit `jmp rel32` to these absolute code buffer
@@ -115,6 +197,7 @@ impl<'a> EmitContext<'a> {
         Self {
             location,
             config,
+            arch: ArchConfig::A64,
             dispatcher_offsets: None,
             code_base_ptr: std::ptr::null(),
             is_single_step: false,
@@ -131,16 +214,17 @@ impl<'a> EmitContext<'a> {
     pub fn with_dispatcher(
         location: LocationDescriptor,
         config: &'a EmitConfig,
+        arch: ArchConfig,
         dispatcher_offsets: [usize; 4],
         code_base_ptr: *const u8,
     ) -> Self {
-        let a64_loc = crate::ir::location::A64LocationDescriptor::from_location(location);
         Self {
             location,
             config,
+            arch,
             dispatcher_offsets: Some(dispatcher_offsets),
             code_base_ptr,
-            is_single_step: a64_loc.single_stepping(),
+            is_single_step: arch.extract_single_stepping(location),
             enable_block_linking: false,
             patch_entries: RefCell::new(Vec::new()),
             block_lookup: None,

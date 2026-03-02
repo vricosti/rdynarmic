@@ -4,7 +4,7 @@ use rxbyak::{dword_ptr, qword_ptr};
 use crate::backend::x64::block_cache::{BlockCache, CachedBlock};
 use crate::backend::x64::block_of_code::{BlockOfCode, DispatcherLabels, JitStateOffsets, RunCodeCallbacks, RunCodeFn};
 use crate::backend::x64::emit::emit_block;
-use crate::backend::x64::emit_context::{EmitConfig, EmitContext};
+use crate::backend::x64::emit_context::{ArchConfig, EmitConfig, EmitContext};
 use crate::backend::x64::jit_state::{A64JitState, RSB_PTR_MASK};
 use crate::backend::x64::patch_info::{PatchTable, PatchType};
 use crate::backend::x64::reg_alloc::RegAlloc;
@@ -165,6 +165,7 @@ impl A64EmitX64 {
             let mut ctx = EmitContext::with_dispatcher(
                 location,
                 &self.emit_config,
+                ArchConfig::A64,
                 self.dispatcher_labels.return_from_run_code,
                 self.code.code_base_ptr(),
             );
@@ -704,6 +705,7 @@ mod tests {
         let ctx = EmitContext::with_dispatcher(
             loc,
             &emit_config,
+            ArchConfig::A64,
             [100, 200, 300, 400],
             std::ptr::null(),
         );
